@@ -31,6 +31,7 @@ pub struct VersionMsg {
     #[serde(rename = "serverVersion")]
     pub server_version: String,
     #[serde(rename = "homeId")]
+    #[allow(dead_code)]
     pub home_id: Option<u64>,
     #[serde(rename = "minSchemaVersion")]
     pub min_schema_version: u32,
@@ -65,6 +66,7 @@ pub struct EventWrapper {
 /// since zwave-js-server event shapes vary by event name.
 #[derive(Debug, Deserialize)]
 pub struct RawEvent {
+    #[allow(dead_code)]
     pub source: String,
     /// The event name, e.g. "value updated", "node status changed".
     pub event: String,
