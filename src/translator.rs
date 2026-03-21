@@ -164,10 +164,21 @@ static ALIAS_TABLE: &[AliasEntry] = &[
     AliasEntry { key: "128/0/level", attribute: "battery",     transform: Transform::Identity, is_write: false },
     AliasEntry { key: "128/0/isLow", attribute: "battery_low", transform: Transform::Identity, is_write: false },
 
-    // Door Lock (CC 98) — 0=unsecured, 255=secured
-    // currentMode is both the read source and the write target; targetMode is not universally
-    // supported by lock firmware and causes zwave_error on devices that omit it.
-    AliasEntry { key: "98/0/currentMode", attribute: "locked", transform: Transform::NonzeroBool, is_write: true },
+    // Door Lock (CC 98)
+    // DoorLockMode: 0=Unsecured, 255=Secured (plus 1,16,17,32,33 for timed/inside/outside variants)
+    // currentMode is read-only (reflects what the hardware confirmed).
+    // targetMode is write-only (sends DoorLockCCOperationSet, which is how zwave-js expects it).
+    AliasEntry { key: "98/0/currentMode",               attribute: "locked",               transform: Transform::NonzeroBool, is_write: false },
+    AliasEntry { key: "98/0/targetMode",                attribute: "locked",               transform: Transform::NonzeroBool, is_write: true  },
+    // Physical sensor feedback — only present when the lock hardware has these sensors
+    AliasEntry { key: "98/0/boltStatus",                attribute: "bolt_status",          transform: Transform::Identity,    is_write: false },
+    AliasEntry { key: "98/0/latchStatus",               attribute: "latch_status",         transform: Transform::Identity,    is_write: false },
+    AliasEntry { key: "98/0/doorStatus",                attribute: "door_status",          transform: Transform::Identity,    is_write: false },
+    // Operation type: 1=Constant (stay locked/unlocked), 2=Timed (auto-relock after timeout)
+    AliasEntry { key: "98/0/operationType",             attribute: "lock_operation_type",  transform: Transform::Identity,    is_write: true  },
+    // Timed mode: seconds until auto-relock.  Requires operationType=2 to be active.
+    AliasEntry { key: "98/0/lockTimeoutConfiguration",  attribute: "lock_timeout_secs",    transform: Transform::Identity,    is_write: true  },
+    AliasEntry { key: "98/0/autoRelockTime",            attribute: "lock_auto_relock_secs",transform: Transform::Identity,    is_write: true  },
 
     // Window Covering (CC 102)
     AliasEntry { key: "102/0/currentValue", attribute: "position", transform: Transform::Identity, is_write: false },
@@ -334,7 +345,7 @@ mod tests {
         let t = Translator::new();
         let target = t.write_target("locked").unwrap();
         assert_eq!(target.command_class, 98);
-        assert_eq!(target.property, "currentMode");
+        assert_eq!(target.property, "targetMode");
         let native = target.transform.reverse(&Value::Bool(true));
         assert_eq!(native, Value::Number(255.into()));
     }

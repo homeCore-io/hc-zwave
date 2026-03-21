@@ -141,6 +141,23 @@ async fn publish_node(client: &AsyncClient, plugin_id: &str, node: &NodeState, t
     let device_id = node_device_id(node.node_id);
     let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
     register_node(client, plugin_id, &device_id, &display_name).await?;
+
+    // Diagnostic: log all CC 98 (Door Lock) value IDs so we can see exactly what the
+    // device reports and verify the write target (targetMode) exists on this node.
+    let cc98_values: Vec<String> = node
+        .values
+        .iter()
+        .filter(|v| v.command_class == 98)
+        .map(|v| {
+            let pk = v.property_key.as_ref().map(|pk| format!("[{pk}]")).unwrap_or_default();
+            let val = v.value.as_ref().map(|val| format!("={val}")).unwrap_or_default();
+            format!("{}{}{}", v.property, pk, val)
+        })
+        .collect();
+    if !cc98_values.is_empty() {
+        info!(node_id = node.node_id, values = ?cc98_values, "Door Lock CC 98 value IDs on this node");
+    }
+
     let state = build_state(node, translator);
     publish_state(client, &device_id, &state).await?;
     publish_availability(client, &device_id, node.is_available()).await?;
@@ -416,7 +433,12 @@ async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translat
     match msg {
         ServerMsg::Event(wrapper) => handle_event(wrapper.event, mqtt, translator, plugin_id).await?,
         ServerMsg::Result(r) if !r.success => {
-            warn!(message_id = %r.message_id, error = ?r.error_code, "zwave-js command failed");
+            warn!(
+                message_id = %r.message_id,
+                error_code = ?r.error_code,
+                result = ?r.result,
+                "zwave-js command failed"
+            );
         }
         _ => {}
     }
@@ -519,8 +541,10 @@ async fn send_set_value(ws_tx: &mut WsSink, cmd: &SetValueCmd) -> Result<()> {
         },
         "value": cmd.value,
     });
+    // Log the exact JSON so we can compare against the zwave-js-server protocol spec.
+    let raw_json = serde_json::to_string(&msg).unwrap_or_default();
+    info!(node_id = cmd.node_id, cc = cmd.command_class, prop = %cmd.property, value = ?cmd.value, json = %raw_json, "Sending node.set_value");
     ws_send(ws_tx, &msg).await?;
-    debug!(node_id = cmd.node_id, cc = cmd.command_class, prop = %cmd.property, "set_value sent");
     Ok(())
 }
 
