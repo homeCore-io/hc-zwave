@@ -310,8 +310,10 @@ impl Bridge {
         let (mqtt_client, mut eventloop) = connect_mqtt(cfg).await?;
 
         // Drain eventloop until we get the ConnAck so subscriptions are live.
+        // Subscribe to all device cmd topics; handle_mqtt_cmd filters to zwave_* devices.
+        // NOTE: MQTT '+' must occupy a full topic level — "zwave_+" is NOT valid.
         mqtt_client
-            .subscribe("homecore/devices/zwave_+/cmd", QoS::AtLeastOnce)
+            .subscribe("homecore/devices/+/cmd", QoS::AtLeastOnce)
             .await?;
         loop {
             match eventloop.poll().await {
@@ -555,11 +557,12 @@ async fn handle_mqtt_cmd(
     if parts.len() != 4 || parts[3] != "cmd" {
         return;
     }
-    let device_segment = parts[2]; // "zwave_5"
+    let device_segment = parts[2];
     let node_id: u32 = match device_segment.strip_prefix("zwave_").and_then(|s| s.parse().ok()) {
         Some(id) => id,
-        None => return,
+        None => return, // not a zwave device — ignore
     };
+    info!(node_id, "Received cmd from HomeCore");
 
     let cmd: Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
