@@ -1,0 +1,346 @@
+//! ValueID ↔ HomeCore attribute translation.
+//!
+//! Maps `{commandClass}/{endpoint}/{property}[/{propertyKey}]` to a canonical
+//! HomeCore attribute name plus an optional value transform.
+//!
+//! For writable attributes (Binary Switch, Dimmer, Lock, Thermostat), the
+//! write target property (e.g. `targetValue`) is recorded separately so
+//! commands are sent to the correct Z-Wave property.
+
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Transform pipeline
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub enum Transform {
+    /// Pass value through unchanged.
+    Identity,
+    /// Non-zero number/bool → true, zero → false.
+    /// Used for Door Lock CC 98: 255 → true (locked), 0 → false.
+    NonzeroBool,
+    /// Integer → canonical string via lookup table.
+    /// Used for Thermostat Mode CC 64.
+    ModeMap,
+}
+
+impl Transform {
+    /// Apply forward transform: raw ZWave value → HomeCore canonical value.
+    pub fn apply(&self, v: &Value) -> Value {
+        match self {
+            Transform::Identity => v.clone(),
+            Transform::NonzeroBool => {
+                let nonzero = match v {
+                    Value::Bool(b) => *b,
+                    Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+                    _ => false,
+                };
+                Value::Bool(nonzero)
+            }
+            Transform::ModeMap => {
+                let key = value_to_string(v);
+                thermostat_mode_fwd()
+                    .get(key.as_str())
+                    .map(|s| Value::String(s.to_string()))
+                    .unwrap_or_else(|| v.clone())
+            }
+        }
+    }
+
+    /// Apply inverse transform: HomeCore command value → native ZWave value.
+    pub fn reverse(&self, v: &Value) -> Value {
+        match self {
+            Transform::Identity => v.clone(),
+            Transform::NonzeroBool => {
+                // true → 255, false → 0  (Door Lock secure/unsecure mode)
+                match v {
+                    Value::Bool(true) => Value::Number(255.into()),
+                    Value::Bool(false) => Value::Number(0.into()),
+                    _ => v.clone(),
+                }
+            }
+            Transform::ModeMap => {
+                let key = value_to_string(v);
+                thermostat_mode_rev()
+                    .get(key.as_str())
+                    .and_then(|n| serde_json::Number::from_f64(*n as f64))
+                    .map(Value::Number)
+                    .unwrap_or_else(|| v.clone())
+            }
+        }
+    }
+}
+
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => v.to_string(),
+    }
+}
+
+// Thermostat Mode CC 64 integer → canonical string
+static THERMOSTAT_MODE_FWD_DATA: &[(&str, &str)] = &[
+    ("0", "off"),
+    ("1", "heat"),
+    ("2", "cool"),
+    ("3", "auto"),
+    ("6", "fan_only"),
+    ("11", "energy_heat"),
+];
+
+// Canonical string → thermostat mode integer
+static THERMOSTAT_MODE_REV_DATA: &[(&str, u64)] = &[
+    ("off", 0),
+    ("heat", 1),
+    ("cool", 2),
+    ("auto", 3),
+    ("fan_only", 6),
+    ("energy_heat", 11),
+];
+
+static THERMOSTAT_MODE_FWD_MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+static THERMOSTAT_MODE_REV_MAP: OnceLock<HashMap<&'static str, u64>> = OnceLock::new();
+
+fn thermostat_mode_fwd() -> &'static HashMap<&'static str, &'static str> {
+    THERMOSTAT_MODE_FWD_MAP.get_or_init(|| THERMOSTAT_MODE_FWD_DATA.iter().cloned().collect())
+}
+
+fn thermostat_mode_rev() -> &'static HashMap<&'static str, u64> {
+    THERMOSTAT_MODE_REV_MAP.get_or_init(|| THERMOSTAT_MODE_REV_DATA.iter().cloned().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Alias table entry
+// ---------------------------------------------------------------------------
+
+struct AliasEntry {
+    /// Alias key: "{cc}/{endpoint}/{property}" or "{cc}/{endpoint}/{property}/{propertyKey}"
+    key: &'static str,
+    attribute: &'static str,
+    transform: Transform,
+    /// If true, this entry is the preferred write target for the attribute.
+    is_write: bool,
+}
+
+/// Full alias table — order matches zwave.toml for consistency.
+static ALIAS_TABLE: &[AliasEntry] = &[
+    // Binary Sensor (CC 48) — read-only
+    AliasEntry { key: "48/0/Motion Detector Status",     attribute: "motion",          transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Door/Window Status",         attribute: "contact_open",    transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Water Leak Status",          attribute: "water_detected",  transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Smoke Alarm Status",         attribute: "smoke",           transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/CO Alarm Status",            attribute: "co",              transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Vibration Detection Status", attribute: "vibration",       transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Tamper Alarm Status",        attribute: "tamper",          transform: Transform::Identity, is_write: false },
+
+    // Binary Switch (CC 37) — currentValue for read, targetValue for write
+    AliasEntry { key: "37/0/currentValue", attribute: "on", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "37/0/targetValue",  attribute: "on", transform: Transform::Identity, is_write: true  },
+
+    // Multilevel Switch / Dimmer (CC 38) — brightness 0-99
+    AliasEntry { key: "38/0/currentValue", attribute: "brightness", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "38/0/targetValue",  attribute: "brightness", transform: Transform::Identity, is_write: true  },
+
+    // Multilevel Sensor (CC 49) — read-only
+    AliasEntry { key: "49/0/Air temperature", attribute: "temperature", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "49/0/Humidity",         attribute: "humidity",    transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "49/0/Luminance",        attribute: "illuminance", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "49/0/Ultraviolet",      attribute: "uv_index",    transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "49/0/CO2 level",        attribute: "co2_ppm",     transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "49/0/Atmospheric pressure", attribute: "pressure", transform: Transform::Identity, is_write: false },
+
+    // Meter (CC 50) — read-only, propertyKey-based
+    AliasEntry { key: "50/0/value/65537", attribute: "power_w",    transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "50/0/value/65538", attribute: "energy_kwh", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "50/0/value/65539", attribute: "voltage",    transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "50/0/value/65540", attribute: "current_a",  transform: Transform::Identity, is_write: false },
+
+    // Battery (CC 128) — read-only
+    AliasEntry { key: "128/0/level", attribute: "battery",     transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "128/0/isLow", attribute: "battery_low", transform: Transform::Identity, is_write: false },
+
+    // Door Lock (CC 98) — 0=unsecured, 255=secured
+    AliasEntry { key: "98/0/currentMode", attribute: "locked", transform: Transform::NonzeroBool, is_write: false },
+    AliasEntry { key: "98/0/targetMode",  attribute: "locked", transform: Transform::NonzeroBool, is_write: true  },
+
+    // Window Covering (CC 102)
+    AliasEntry { key: "102/0/currentValue", attribute: "position", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "102/0/targetValue",  attribute: "position", transform: Transform::Identity, is_write: true  },
+
+    // Color Switch (CC 51)
+    AliasEntry { key: "51/0/currentColor", attribute: "color_rgb", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "51/0/targetColor",  attribute: "color_rgb", transform: Transform::Identity, is_write: true  },
+
+    // Thermostat Setpoint (CC 67) — endpoint 1 = heating setpoint
+    AliasEntry { key: "67/1/value", attribute: "target_temp", transform: Transform::Identity, is_write: true },
+
+    // Thermostat Mode (CC 64)
+    AliasEntry { key: "64/0/mode", attribute: "mode", transform: Transform::ModeMap, is_write: true },
+
+    // Thermostat Operating State (CC 66) — read-only
+    AliasEntry { key: "66/0/state", attribute: "hvac_action", transform: Transform::Identity, is_write: false },
+
+    // Notification (CC 113) — read-only binary sensors
+    AliasEntry { key: "113/0/Access Control", attribute: "locked",         transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "113/0/Home Security",  attribute: "tamper",         transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "113/0/Smoke Alarm",    attribute: "smoke",          transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "113/0/CO Alarm",       attribute: "co",             transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "113/0/Water Alarm",    attribute: "water_detected", transform: Transform::Identity, is_write: false },
+];
+
+// ---------------------------------------------------------------------------
+// Write target
+// ---------------------------------------------------------------------------
+
+pub struct WriteTarget {
+    pub command_class: u32,
+    pub endpoint: u32,
+    pub property: String,
+    pub transform: Transform,
+}
+
+// ---------------------------------------------------------------------------
+// Translator
+// ---------------------------------------------------------------------------
+
+pub struct Translator {
+    /// Forward map: alias_key → (attribute, transform)
+    forward: HashMap<String, (String, Transform)>,
+    /// Reverse map: attribute → write target (cc/endpoint/property + inverse transform)
+    reverse: HashMap<String, WriteTarget>,
+}
+
+impl Translator {
+    pub fn new() -> Self {
+        let mut forward: HashMap<String, (String, Transform)> = HashMap::new();
+        let mut reverse: HashMap<String, WriteTarget> = HashMap::new();
+
+        for entry in ALIAS_TABLE {
+            // Split key to extract cc and endpoint for the reverse target
+            forward
+                .entry(entry.key.to_string())
+                .or_insert_with(|| (entry.attribute.to_string(), entry.transform.clone()));
+
+            if entry.is_write {
+                let parts: Vec<&str> = entry.key.splitn(4, '/').collect();
+                if parts.len() >= 3 {
+                    let cc: u32 = parts[0].parse().unwrap_or(0);
+                    let ep: u32 = parts[1].parse().unwrap_or(0);
+                    let prop = parts[2].to_string();
+                    reverse.insert(
+                        entry.attribute.to_string(),
+                        WriteTarget {
+                            command_class: cc,
+                            endpoint: ep,
+                            property: prop,
+                            transform: entry.transform.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        Self { forward, reverse }
+    }
+
+    /// Build the alias key from a ValueID's components.
+    pub fn alias_key(cc: u32, endpoint: u32, property: &str, property_key: Option<&str>) -> String {
+        match property_key {
+            Some(pk) => format!("{cc}/{endpoint}/{property}/{pk}"),
+            None => format!("{cc}/{endpoint}/{property}"),
+        }
+    }
+
+    /// Translate a raw ZWave value to `(attribute_name, canonical_value)`.
+    /// Returns `None` if this ValueID is not in the alias table.
+    pub fn translate(
+        &self,
+        cc: u32,
+        endpoint: u32,
+        property: &str,
+        property_key: Option<&str>,
+        raw_value: &Value,
+    ) -> Option<(String, Value)> {
+        let key = Self::alias_key(cc, endpoint, property, property_key);
+        let (attr, transform) = self.forward.get(&key)?;
+        Some((attr.clone(), transform.apply(raw_value)))
+    }
+
+    /// Find the write target for a HomeCore attribute.
+    pub fn write_target(&self, attribute: &str) -> Option<&WriteTarget> {
+        self.reverse.get(attribute)
+    }
+}
+
+/// Stringify a `propertyKey` Value for use in alias keys.
+/// Returns `None` if the key is null/absent (omit from key).
+pub fn property_key_str(pk: &Value) -> Option<String> {
+    match pk {
+        Value::Null => None,
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if s.is_empty() => None,
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_switch_forward() {
+        let t = Translator::new();
+        let (attr, val) = t.translate(37, 0, "currentValue", None, &Value::Bool(true)).unwrap();
+        assert_eq!(attr, "on");
+        assert_eq!(val, Value::Bool(true));
+    }
+
+    #[test]
+    fn door_lock_nonzero_bool() {
+        let t = Translator::new();
+        let (attr, val) = t.translate(98, 0, "currentMode", None, &Value::Number(255.into())).unwrap();
+        assert_eq!(attr, "locked");
+        assert_eq!(val, Value::Bool(true));
+
+        let (_, val2) = t.translate(98, 0, "currentMode", None, &Value::Number(0.into())).unwrap();
+        assert_eq!(val2, Value::Bool(false));
+    }
+
+    #[test]
+    fn thermostat_mode_map() {
+        let t = Translator::new();
+        let (attr, val) = t.translate(64, 0, "mode", None, &Value::Number(1.into())).unwrap();
+        assert_eq!(attr, "mode");
+        assert_eq!(val, Value::String("heat".into()));
+    }
+
+    #[test]
+    fn meter_propertykey() {
+        let t = Translator::new();
+        let (attr, val) = t.translate(50, 0, "value", Some("65537"), &serde_json::json!(120.5)).unwrap();
+        assert_eq!(attr, "power_w");
+        assert_eq!(val, serde_json::json!(120.5));
+    }
+
+    #[test]
+    fn door_lock_reverse() {
+        let t = Translator::new();
+        let target = t.write_target("locked").unwrap();
+        assert_eq!(target.command_class, 98);
+        assert_eq!(target.property, "targetMode");
+        let native = target.transform.reverse(&Value::Bool(true));
+        assert_eq!(native, Value::Number(255.into()));
+    }
+
+    #[test]
+    fn unknown_cc_returns_none() {
+        let t = Translator::new();
+        assert!(t.translate(999, 0, "unknownProp", None, &Value::Bool(true)).is_none());
+    }
+}
