@@ -144,9 +144,12 @@ impl NodeState {
         }
     }
 
-    /// Whether the node is reachable (Alive or Awake).
+    /// Whether the node is reachable.
+    /// NodeStatus: 0=Unknown, 1=Asleep, 2=Awake, 3=Dead, 4=Alive.
+    /// Asleep is normal for battery devices — they wake periodically and are
+    /// still functional.  Only Dead (3) means the node cannot be reached.
     pub fn is_available(&self) -> bool {
-        matches!(self.status, Some(2) | Some(4) | None)
+        !matches!(self.status, Some(3))
     }
 }
 

@@ -21,7 +21,11 @@ pub enum Transform {
     Identity,
     /// Non-zero number/bool → true, zero → false.
     /// Used for Door Lock CC 98: 255 → true (locked), 0 → false.
+    /// Also used for CC 113 Notification "Opening state" (1=open, 0=closed).
     NonzeroBool,
+    /// CC 113 Access Control "Door state" numeric → contact_open bool.
+    /// 22 = "Window/door is open" → true, 23 = "closed" / 0 = idle → false.
+    AccessControlDoorState,
     /// Integer → canonical string via lookup table.
     /// Used for Thermostat Mode CC 64.
     ModeMap,
@@ -39,6 +43,11 @@ impl Transform {
                     _ => false,
                 };
                 Value::Bool(nonzero)
+            }
+            Transform::AccessControlDoorState => {
+                // 22 = "Window/door is open", 23 = "Window/door is closed", 0 = idle
+                let open = v.as_u64() == Some(22);
+                Value::Bool(open)
             }
             Transform::ModeMap => {
                 let key = value_to_string(v);
@@ -62,6 +71,7 @@ impl Transform {
                     _ => v.clone(),
                 }
             }
+            Transform::AccessControlDoorState => v.clone(), // read-only
             Transform::ModeMap => {
                 let key = value_to_string(v);
                 thermostat_mode_rev()
@@ -130,13 +140,21 @@ struct AliasEntry {
 /// Full alias table — order matches zwave.toml for consistency.
 static ALIAS_TABLE: &[AliasEntry] = &[
     // Binary Sensor (CC 48) — read-only
-    AliasEntry { key: "48/0/Motion Detector Status",     attribute: "motion",          transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/Door/Window Status",         attribute: "contact_open",    transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/Water Leak Status",          attribute: "water_detected",  transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/Smoke Alarm Status",         attribute: "smoke",           transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/CO Alarm Status",            attribute: "co",              transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/Vibration Detection Status", attribute: "vibration",       transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "48/0/Tamper Alarm Status",        attribute: "tamper",          transform: Transform::Identity, is_write: false },
+    // `property` is the BinarySensorType enum name exactly as zwave-js emits it.
+    // newValue is boolean: true = triggered/open, false = clear/closed.
+    AliasEntry { key: "48/0/Motion",       attribute: "motion",         transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Door/Window",  attribute: "contact_open",   transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Water",        attribute: "water_detected", transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Smoke",        attribute: "smoke",          transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/CO",           attribute: "co",             transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/CO2",          attribute: "co2_alarm",      transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Heat",         attribute: "heat_alarm",     transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Freeze",       attribute: "freeze",         transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Tamper",       attribute: "tamper",         transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Tilt",         attribute: "tilt",           transform: Transform::Identity, is_write: false },
+    AliasEntry { key: "48/0/Glass Break",  attribute: "glass_break",    transform: Transform::Identity, is_write: false },
+    // CC 48 v1 devices report all sensor types as "Any" — treat as generic contact
+    AliasEntry { key: "48/0/Any",          attribute: "sensor_active",  transform: Transform::Identity, is_write: false },
 
     // Binary Switch (CC 37) — currentValue for read, targetValue for write
     AliasEntry { key: "37/0/currentValue", attribute: "on", transform: Transform::Identity, is_write: false },
@@ -197,12 +215,29 @@ static ALIAS_TABLE: &[AliasEntry] = &[
     // Thermostat Operating State (CC 66) — read-only
     AliasEntry { key: "66/0/state", attribute: "hvac_action", transform: Transform::Identity, is_write: false },
 
-    // Notification (CC 113) — read-only binary sensors
-    AliasEntry { key: "113/0/Access Control", attribute: "locked",         transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "113/0/Home Security",  attribute: "tamper",         transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "113/0/Smoke Alarm",    attribute: "smoke",          transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "113/0/CO Alarm",       attribute: "co",             transform: Transform::Identity, is_write: false },
-    AliasEntry { key: "113/0/Water Alarm",    attribute: "water_detected", transform: Transform::Identity, is_write: false },
+    // Notification (CC 113) — read-only.
+    // CC 113 ALWAYS has a propertyKey (the variable name string); entries without
+    // a propertyKey will never match.  Key format: "{cc}/{ep}/{property}/{propertyKey}".
+    //
+    // Access Control (notification type 0x06)
+    // "Door state": 22 = open, 23 = closed, 0 = idle
+    AliasEntry { key: "113/0/Access Control/Door state",    attribute: "contact_open", transform: Transform::AccessControlDoorState, is_write: false },
+    // "Opening state": synthetic value created by zwave-js; 1 = open, 0 = closed
+    AliasEntry { key: "113/0/Access Control/Opening state", attribute: "contact_open", transform: Transform::NonzeroBool,            is_write: false },
+    //
+    // Home Security (notification type 0x07)
+    // "Motion sensor status": 0 = idle, non-zero = motion detected
+    AliasEntry { key: "113/0/Home Security/Motion sensor status",                attribute: "motion",         transform: Transform::NonzeroBool, is_write: false },
+    // Tamper events (product cover removed or invalid code attempts)
+    AliasEntry { key: "113/0/Home Security/Tampering, Product cover removed",    attribute: "tamper",         transform: Transform::NonzeroBool, is_write: false },
+    AliasEntry { key: "113/0/Home Security/Tampering, invalid code",             attribute: "tamper",         transform: Transform::NonzeroBool, is_write: false },
+    //
+    // Smoke Alarm (notification type 0x01)
+    AliasEntry { key: "113/0/Smoke Alarm/Smoke sensor status",                   attribute: "smoke",          transform: Transform::NonzeroBool, is_write: false },
+    // CO Alarm (notification type 0x02)
+    AliasEntry { key: "113/0/CO Alarm/CO sensor status",                         attribute: "co",             transform: Transform::NonzeroBool, is_write: false },
+    // Water Alarm (notification type 0x05)
+    AliasEntry { key: "113/0/Water Alarm/Sensor status",                         attribute: "water_detected", transform: Transform::NonzeroBool, is_write: false },
 ];
 
 // ---------------------------------------------------------------------------
@@ -354,5 +389,61 @@ mod tests {
     fn unknown_cc_returns_none() {
         let t = Translator::new();
         assert!(t.translate(999, 0, "unknownProp", None, &Value::Bool(true)).is_none());
+    }
+
+    #[test]
+    fn cc48_contact_sensor() {
+        let t = Translator::new();
+        // Door/Window open (true) and closed (false)
+        let (attr, val) = t.translate(48, 0, "Door/Window", None, &Value::Bool(true)).unwrap();
+        assert_eq!(attr, "contact_open");
+        assert_eq!(val, Value::Bool(true));
+
+        let (_, val2) = t.translate(48, 0, "Door/Window", None, &Value::Bool(false)).unwrap();
+        assert_eq!(val2, Value::Bool(false));
+
+        // Motion sensor
+        let (attr3, _) = t.translate(48, 0, "Motion", None, &Value::Bool(true)).unwrap();
+        assert_eq!(attr3, "motion");
+
+        // Old "Door/Window Status" key should no longer match
+        assert!(t.translate(48, 0, "Door/Window Status", None, &Value::Bool(true)).is_none());
+    }
+
+    #[test]
+    fn cc113_access_control_door_state() {
+        let t = Translator::new();
+        // 22 = open
+        let (attr, val) = t.translate(113, 0, "Access Control", Some("Door state"), &Value::Number(22.into())).unwrap();
+        assert_eq!(attr, "contact_open");
+        assert_eq!(val, Value::Bool(true));
+
+        // 23 = closed
+        let (_, val2) = t.translate(113, 0, "Access Control", Some("Door state"), &Value::Number(23.into())).unwrap();
+        assert_eq!(val2, Value::Bool(false));
+
+        // 0 = idle
+        let (_, val3) = t.translate(113, 0, "Access Control", Some("Door state"), &Value::Number(0.into())).unwrap();
+        assert_eq!(val3, Value::Bool(false));
+    }
+
+    #[test]
+    fn cc113_opening_state() {
+        let t = Translator::new();
+        // 1 = open, 0 = closed (synthetic value from zwave-js)
+        let (attr, val) = t.translate(113, 0, "Access Control", Some("Opening state"), &Value::Number(1.into())).unwrap();
+        assert_eq!(attr, "contact_open");
+        assert_eq!(val, Value::Bool(true));
+
+        let (_, val2) = t.translate(113, 0, "Access Control", Some("Opening state"), &Value::Number(0.into())).unwrap();
+        assert_eq!(val2, Value::Bool(false));
+    }
+
+    #[test]
+    fn cc113_no_propertykey_does_not_match() {
+        // CC 113 without a propertyKey should not match anything — it always has one.
+        let t = Translator::new();
+        assert!(t.translate(113, 0, "Access Control", None, &Value::Number(22.into())).is_none());
+        assert!(t.translate(113, 0, "Home Security", None, &Value::Number(1.into())).is_none());
     }
 }

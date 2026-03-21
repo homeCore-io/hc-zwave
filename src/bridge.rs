@@ -466,20 +466,50 @@ async fn handle_event(
                     if let Some((attr, val)) =
                         translator.translate(args.command_class, args.endpoint, &args.property, pk, &args.new_value)
                     {
-                        debug!(node_id, %attr, "Value updated");
+                        debug!(node_id, %attr, value = ?val, "Value translated → publishing");
                         let patch = json!({ attr: val });
                         publish_partial(mqtt, &device_id, &patch).await?;
+                    } else {
+                        // Log unmatched sensor CCs at debug so mismatches are diagnosable.
+                        let cc = args.command_class;
+                        if cc == 48 || cc == 113 {
+                            debug!(
+                                node_id,
+                                cc,
+                                prop = %args.property,
+                                prop_key = ?pk,
+                                value = ?args.new_value,
+                                "Unmatched sensor value — no alias table entry"
+                            );
+                        }
                     }
                 }
             }
         }
 
         "node status changed" => {
-            // args.status: 1=Asleep, 2=Awake, 3=Dead, 4=Alive
+            // NodeStatus: 0=Unknown, 1=Asleep, 2=Awake, 3=Dead, 4=Alive.
+            // Battery sensors regularly go Asleep between readings — that is normal
+            // operation, not an outage.  Only Dead (3) means the node is unreachable.
             let status = ev.args.as_ref().and_then(|a| a.get("status")).and_then(|s| s.as_u64());
-            let available = matches!(status, Some(2) | Some(4));
+            let available = !matches!(status, Some(3));
             publish_availability(mqtt, &device_id, available).await?;
             info!(node_id, ?status, available, "Node status changed");
+        }
+
+        // Direct node lifecycle events forwarded by zwave-js-server
+        "dead" => {
+            publish_availability(mqtt, &device_id, false).await?;
+            info!(node_id, "Node dead");
+        }
+        "alive" | "wake up" => {
+            publish_availability(mqtt, &device_id, true).await?;
+            info!(node_id, event = %ev.event, "Node alive/awake");
+        }
+        "sleep" => {
+            // Sleeping is normal for battery devices — keep current availability,
+            // do not mark offline.
+            debug!(node_id, "Node sleeping (battery device)");
         }
 
         "node ready" => {
