@@ -165,8 +165,9 @@ static ALIAS_TABLE: &[AliasEntry] = &[
     AliasEntry { key: "128/0/isLow", attribute: "battery_low", transform: Transform::Identity, is_write: false },
 
     // Door Lock (CC 98) — 0=unsecured, 255=secured
-    AliasEntry { key: "98/0/currentMode", attribute: "locked", transform: Transform::NonzeroBool, is_write: false },
-    AliasEntry { key: "98/0/targetMode",  attribute: "locked", transform: Transform::NonzeroBool, is_write: true  },
+    // currentMode is both the read source and the write target; targetMode is not universally
+    // supported by lock firmware and causes zwave_error on devices that omit it.
+    AliasEntry { key: "98/0/currentMode", attribute: "locked", transform: Transform::NonzeroBool, is_write: true },
 
     // Window Covering (CC 102)
     AliasEntry { key: "102/0/currentValue", attribute: "position", transform: Transform::Identity, is_write: false },
@@ -333,7 +334,7 @@ mod tests {
         let t = Translator::new();
         let target = t.write_target("locked").unwrap();
         assert_eq!(target.command_class, 98);
-        assert_eq!(target.property, "targetMode");
+        assert_eq!(target.property, "currentMode");
         let native = target.transform.reverse(&Value::Bool(true));
         assert_eq!(native, Value::Number(255.into()));
     }

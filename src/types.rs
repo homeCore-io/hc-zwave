@@ -160,7 +160,7 @@ fn de_string_or_num<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    use serde::de::{Error, Unexpected, Visitor};
+    use serde::de::{Error, Visitor};
     struct StrOrNum;
     impl<'de> Visitor<'de> for StrOrNum {
         type Value = String;
