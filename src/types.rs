@@ -5,7 +5,7 @@
 //!   - `"result"`   — response to commands we send
 //!   - `"event"`    — ongoing node/controller events
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +110,8 @@ pub struct NodeState {
     pub location: Option<String>,
     /// 1=Asleep, 2=Awake, 3=Dead, 4=Alive, 5=Unknown
     pub status: Option<u8>,
+    /// Values may be absent on freshly-included nodes or those still interviewing.
+    #[serde(default)]
     pub values: Vec<NodeValue>,
 }
 
@@ -119,6 +121,8 @@ pub struct NodeValue {
     #[serde(rename = "commandClass")]
     pub command_class: u32,
     pub endpoint: u32,
+    /// zwave-js can send `property` as either a string or an integer (e.g. 37).
+    #[serde(deserialize_with = "de_string_or_num")]
     pub property: String,
     #[serde(rename = "propertyKey")]
     pub property_key: Option<Value>,
@@ -127,12 +131,66 @@ pub struct NodeValue {
 
 impl NodeState {
     /// Parse from the raw JSON returned by start_listening or nodeState.
+    /// Logs a warning and returns None if the node itself can't be parsed,
+    /// but individual bad values are already filtered by NodeValue's deserializer.
     pub fn from_value(v: &Value) -> Option<Self> {
-        serde_json::from_value(v.clone()).ok()
+        match serde_json::from_value(v.clone()) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                let node_id = v.get("nodeId").and_then(|n| n.as_u64()).unwrap_or(0);
+                tracing::warn!(node_id, error = %e, "Failed to parse NodeState — node skipped");
+                None
+            }
+        }
     }
 
     /// Whether the node is reachable (Alive or Awake).
     pub fn is_available(&self) -> bool {
         matches!(self.status, Some(2) | Some(4) | None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Deserialize a field that zwave-js may send as either a JSON string or a
+/// JSON number (e.g. the `property` field on some command classes).
+fn de_string_or_num<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    struct StrOrNum;
+    impl<'de> Visitor<'de> for StrOrNum {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or integer")
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+        fn visit_string<E: Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_bool<E: Error>(self, v: bool) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_none<E: Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_unit<E: Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+    }
+    d.deserialize_any(StrOrNum)
 }
