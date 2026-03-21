@@ -69,6 +69,26 @@ async fn publish_availability(client: &AsyncClient, device_id: &str, available: 
     Ok(())
 }
 
+async fn register_node(
+    client: &AsyncClient,
+    plugin_id: &str,
+    device_id: &str,
+    name: &str,
+) -> Result<()> {
+    let topic = format!("homecore/plugins/{plugin_id}/register");
+    let payload = serde_json::json!({
+        "device_id": device_id,
+        "plugin_id": plugin_id,
+        "name":      name,
+        "device_type": "zwave",
+    });
+    client
+        .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
+        .await
+        .context("register_node failed")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Node state → MQTT
 // ---------------------------------------------------------------------------
@@ -117,8 +137,10 @@ fn translate_node_value(
     }
 }
 
-async fn publish_node(client: &AsyncClient, node: &NodeState, translator: &Translator) -> Result<()> {
+async fn publish_node(client: &AsyncClient, plugin_id: &str, node: &NodeState, translator: &Translator) -> Result<()> {
     let device_id = node_device_id(node.node_id);
+    let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
+    register_node(client, plugin_id, &device_id, &display_name).await?;
     let state = build_state(node, translator);
     publish_state(client, &device_id, &state).await?;
     publish_availability(client, &device_id, node.is_available()).await?;
@@ -311,8 +333,9 @@ impl Bridge {
         let nodes = handshake(&mut ws_tx, &mut ws_rx, cfg.server.schema_version).await?;
 
         // --- Publish initial state ---
+        let plugin_id = &cfg.homecore.plugin_id;
         for node in &nodes {
-            if let Err(e) = publish_node(&mqtt_client, node, &translator).await {
+            if let Err(e) = publish_node(&mqtt_client, plugin_id, node, &translator).await {
                 warn!(node_id = node.node_id, error = %e, "Failed to publish initial node state");
             }
         }
@@ -322,8 +345,9 @@ impl Bridge {
 
         // Spawn the WS task (owns ws_tx + ws_rx, reads cmd_rx, writes MQTT)
         let mqtt_c = mqtt_client.clone();
+        let plugin_id_owned = cfg.homecore.plugin_id.clone();
         let ws_task = tokio::spawn(async move {
-            ws_event_loop(&mut ws_tx, &mut ws_rx, &mut cmd_rx, &mqtt_c, &translator).await
+            ws_event_loop(&mut ws_tx, &mut ws_rx, &mut cmd_rx, &mqtt_c, &translator, &plugin_id_owned).await
         });
 
         // MQTT event loop in current task (reads cmd topic, sends to cmd_tx)
@@ -343,6 +367,7 @@ async fn ws_event_loop(
     cmd_rx: &mut mpsc::Receiver<SetValueCmd>,
     mqtt: &AsyncClient,
     translator: &Translator,
+    plugin_id: &str,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -350,7 +375,7 @@ async fn ws_event_loop(
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_ws_message(&text, mqtt, translator).await {
+                        if let Err(e) = handle_ws_message(&text, mqtt, translator, plugin_id).await {
                             warn!(error = %e, "Error handling WS message");
                         }
                     }
@@ -377,7 +402,7 @@ async fn ws_event_loop(
     Ok(())
 }
 
-async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translator) -> Result<()> {
+async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translator, plugin_id: &str) -> Result<()> {
     let msg: ServerMsg = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -387,7 +412,7 @@ async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translat
     };
 
     match msg {
-        ServerMsg::Event(wrapper) => handle_event(wrapper.event, mqtt, translator).await?,
+        ServerMsg::Event(wrapper) => handle_event(wrapper.event, mqtt, translator, plugin_id).await?,
         ServerMsg::Result(r) if !r.success => {
             warn!(message_id = %r.message_id, error = ?r.error_code, "zwave-js command failed");
         }
@@ -400,6 +425,7 @@ async fn handle_event(
     ev: crate::types::RawEvent,
     mqtt: &AsyncClient,
     translator: &Translator,
+    plugin_id: &str,
 ) -> Result<()> {
     let node_id = match ev.node_id {
         Some(id) => id,
@@ -435,6 +461,8 @@ async fn handle_event(
         "node ready" => {
             if let Some(ns_val) = ev.node_state {
                 if let Some(node) = NodeState::from_value(&ns_val) {
+                    let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
+                    register_node(mqtt, plugin_id, &device_id, &display_name).await?;
                     let state = build_state(&node, translator);
                     publish_state(mqtt, &device_id, &state).await?;
                     publish_availability(mqtt, &device_id, node.is_available()).await?;
@@ -445,6 +473,7 @@ async fn handle_event(
 
         "node name updated" => {
             if let Some(name) = ev.name {
+                register_node(mqtt, plugin_id, &device_id, &name).await?;
                 let patch = json!({ "name": name });
                 publish_partial(mqtt, &device_id, &patch).await?;
                 debug!(node_id, %name, "Node name updated");
