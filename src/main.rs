@@ -13,6 +13,7 @@
 
 mod bridge;
 mod config;
+mod logging;
 mod translator;
 mod types;
 
@@ -52,38 +53,18 @@ async fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Logging: stderr (RUST_LOG filtered) + rolling daily file in logs/
+// Logging: stderr (RUST_LOG filtered) + rotating compressed file in logs/
 // ---------------------------------------------------------------------------
 
 fn init_logging(config_path: &str) -> tracing_appender::non_blocking::WorkerGuard {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
-
-    let log_dir = std::path::Path::new(config_path)
-        .parent()                          // config/
-        .and_then(|p| p.parent())          // plugin root
-        .map(|p| p.join("logs"))
-        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
-    std::fs::create_dir_all(&log_dir).ok();
-
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "hc-zwave.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    let stderr_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "hc_zwave=info".parse().unwrap());
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(stderr_filter);
-
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(EnvFilter::new("debug"));
-
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(file_layer)
-        .init();
-
-    guard
+    #[derive(serde::Deserialize, Default)]
+    struct Bootstrap {
+        #[serde(default)]
+        logging: logging::LoggingConfig,
+    }
+    let bootstrap: Bootstrap = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    logging::init_logging(config_path, "hc-zwave", "hc_zwave=info", &bootstrap.logging)
 }
