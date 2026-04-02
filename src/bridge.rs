@@ -27,6 +27,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const PLUGIN_SOURCE: &str = "hc-zwave";
+
 // ---------------------------------------------------------------------------
 // MQTT helpers
 // ---------------------------------------------------------------------------
@@ -44,8 +46,9 @@ async fn connect_mqtt(cfg: &Config) -> Result<(AsyncClient, EventLoop)> {
 
 async fn publish_state(client: &AsyncClient, device_id: &str, state: &Value) -> Result<()> {
     let topic = format!("homecore/devices/{device_id}/state");
+    let payload = with_default_change(state);
     client
-        .publish(&topic, QoS::AtLeastOnce, true, serde_json::to_vec(state)?)
+        .publish(&topic, QoS::AtLeastOnce, true, serde_json::to_vec(&payload)?)
         .await
         .context("publish state")?;
     Ok(())
@@ -53,11 +56,40 @@ async fn publish_state(client: &AsyncClient, device_id: &str, state: &Value) -> 
 
 async fn publish_partial(client: &AsyncClient, device_id: &str, patch: &Value) -> Result<()> {
     let topic = format!("homecore/devices/{device_id}/state/partial");
+    let payload = with_default_change(patch);
     client
-        .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(patch)?)
+        .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
         .await
         .context("publish partial")?;
     Ok(())
+}
+
+fn with_default_change(payload: &Value) -> Value {
+    if payload
+        .get("_hc")
+        .and_then(|v| v.get("change"))
+        .is_some()
+    {
+        return payload.clone();
+    }
+
+    let mut payload = match payload.clone() {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    let mut hc = payload
+        .remove("_hc")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    hc.insert(
+        "change".to_string(),
+        json!({
+            "kind": "external",
+            "source": PLUGIN_SOURCE,
+        }),
+    );
+    payload.insert("_hc".to_string(), Value::Object(hc));
+    Value::Object(payload)
 }
 
 async fn publish_availability(client: &AsyncClient, device_id: &str, available: bool) -> Result<()> {
