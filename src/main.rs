@@ -19,6 +19,7 @@ mod types;
 
 use bridge::Bridge;
 use config::Config;
+use std::path::{Path, PathBuf};
 use tracing::error;
 
 #[tokio::main]
@@ -46,7 +47,13 @@ async fn main() {
         "hc-zwave starting",
     );
 
-    if let Err(e) = (Bridge { config: cfg }).run().await {
+    if let Err(e) = (Bridge {
+        config: cfg,
+        published_ids_cache_path: published_ids_cache_path(&config_path),
+    })
+    .run()
+    .await
+    {
         error!(error = %e, "Bridge exited with error");
         std::process::exit(1);
     }
@@ -67,4 +74,11 @@ fn init_logging(config_path: &str) -> tracing_appender::non_blocking::WorkerGuar
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
     logging::init_logging(config_path, "hc-zwave", "hc_zwave=info", &bootstrap.logging)
+}
+
+fn published_ids_cache_path(config_path: &str) -> PathBuf {
+    Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".published-device-ids.json")
 }

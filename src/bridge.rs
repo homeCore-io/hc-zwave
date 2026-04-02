@@ -20,6 +20,7 @@ use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -66,6 +67,52 @@ async fn publish_availability(client: &AsyncClient, device_id: &str, available: 
         .publish(&topic, QoS::AtLeastOnce, true, payload.as_bytes())
         .await
         .context("publish availability")?;
+    Ok(())
+}
+
+async fn clear_retained_topic(client: &AsyncClient, topic: String) -> Result<()> {
+    client
+        .publish(topic, QoS::AtLeastOnce, true, Vec::<u8>::new())
+        .await
+        .context("clear retained topic")?;
+    Ok(())
+}
+
+async fn unregister_device(
+    client: &AsyncClient,
+    plugin_id: &str,
+    device_id: &str,
+) -> Result<()> {
+    clear_retained_topic(client, format!("homecore/devices/{device_id}/state")).await?;
+    clear_retained_topic(client, format!("homecore/devices/{device_id}/availability")).await?;
+    clear_retained_topic(client, format!("homecore/devices/{device_id}/schema")).await?;
+
+    let payload = json!({
+        "device_id": device_id,
+        "plugin_id": plugin_id,
+    });
+    client
+        .publish(
+            format!("homecore/plugins/{plugin_id}/unregister"),
+            QoS::AtLeastOnce,
+            false,
+            serde_json::to_vec(&payload)?,
+        )
+        .await
+        .context("unregister_device failed")?;
+    Ok(())
+}
+
+fn load_published_ids(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_published_ids(path: &Path, device_ids: &[String]) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(device_ids)?;
+    std::fs::write(path, payload)?;
     Ok(())
 }
 
@@ -299,6 +346,7 @@ struct SetValueCmd {
 
 pub struct Bridge {
     pub config: Config,
+    pub published_ids_cache_path: PathBuf,
 }
 
 impl Bridge {
@@ -350,14 +398,29 @@ impl Bridge {
         // --- Handshake ---
         let translator = Translator::new();
         let nodes = handshake(&mut ws_tx, &mut ws_rx, cfg.server.schema_version).await?;
+        let current_ids: Vec<String> = nodes
+            .iter()
+            .map(|node| node_device_id(node.node_id))
+            .collect();
 
         // --- Publish initial state ---
         let plugin_id = &cfg.homecore.plugin_id;
+        for stale_id in load_published_ids(&self.published_ids_cache_path)
+            .into_iter()
+            .filter(|device_id| !current_ids.iter().any(|current| current == device_id))
+        {
+            if let Err(e) = unregister_device(&mqtt_client, plugin_id, &stale_id).await {
+                warn!(device_id = %stale_id, error = %e, "Failed to unregister stale Z-Wave device");
+            } else {
+                info!(device_id = %stale_id, "Unregistered stale Z-Wave device");
+            }
+        }
         for node in &nodes {
             if let Err(e) = publish_node(&mqtt_client, plugin_id, node, &translator).await {
                 warn!(node_id = node.node_id, error = %e, "Failed to publish initial node state");
             }
         }
+        save_published_ids(&self.published_ids_cache_path, &current_ids)?;
 
         // --- Command channel: MQTT reader → WS sender ---
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<SetValueCmd>(64);
@@ -543,8 +606,8 @@ async fn handle_event(
         }
 
         "node removed" => {
-            publish_availability(mqtt, &device_id, false).await?;
-            info!(node_id, "Node removed");
+            unregister_device(mqtt, plugin_id, &device_id).await?;
+            info!(node_id, "Node removed and unregistered");
         }
 
         _ => {
