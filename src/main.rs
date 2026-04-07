@@ -17,10 +17,17 @@ mod logging;
 mod translator;
 mod types;
 
+use anyhow::Result;
 use bridge::Bridge;
 use config::Config;
+use plugin_sdk_rs::{PluginClient, PluginConfig};
 use std::path::{Path, PathBuf};
-use tracing::error;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_DELAY_SECS: u64 = 60;
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +35,7 @@ async fn main() {
         .nth(1)
         .unwrap_or_else(|| "config/config.toml".to_string());
 
-    let _log_guard = init_logging(&config_path);
+    let (_log_guard, log_level_handle, mqtt_log_handle) = init_logging(&config_path);
 
     let cfg = match Config::load(&config_path) {
         Ok(c) => c,
@@ -38,32 +45,32 @@ async fn main() {
         }
     };
 
-    tracing::info!(
-        config      = %config_path,
-        plugin_id   = %cfg.homecore.plugin_id,
-        broker_host = %cfg.homecore.broker_host,
-        broker_port = cfg.homecore.broker_port,
-        server_url  = %cfg.server.url,
-        "hc-zwave starting",
-    );
-
-    if let Err(e) = (Bridge {
-        config: cfg,
-        published_ids_cache_path: published_ids_cache_path(&config_path),
-    })
-    .run()
-    .await
-    {
-        error!(error = %e, "Bridge exited with error");
-        std::process::exit(1);
+    for attempt in 1..=MAX_ATTEMPTS {
+        info!(attempt, max = MAX_ATTEMPTS, "Starting hc-zwave plugin");
+        match try_start(&cfg, &config_path, log_level_handle.clone(), mqtt_log_handle.clone()).await {
+            Ok(()) => return,
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    error!(
+                        error = %e,
+                        attempt,
+                        "Startup failed; retrying in {RETRY_DELAY_SECS} s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
+                } else {
+                    error!(error = %e, "Startup failed after {MAX_ATTEMPTS} attempts; exiting");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Logging: stderr (RUST_LOG filtered) + rotating compressed file in logs/
+// Logging: stderr (filtered) + rotating compressed file in logs/
 // ---------------------------------------------------------------------------
 
-fn init_logging(config_path: &str) -> tracing_appender::non_blocking::WorkerGuard {
+fn init_logging(config_path: &str) -> (tracing_appender::non_blocking::WorkerGuard, hc_logging::LogLevelHandle, plugin_sdk_rs::mqtt_log_layer::MqttLogHandle) {
     #[derive(serde::Deserialize, Default)]
     struct Bootstrap {
         #[serde(default)]
@@ -74,6 +81,84 @@ fn init_logging(config_path: &str) -> tracing_appender::non_blocking::WorkerGuar
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
     logging::init_logging(config_path, "hc-zwave", "hc_zwave=info", &bootstrap.logging)
+}
+
+// ---------------------------------------------------------------------------
+// Startup — everything that can fail (retried up to MAX_ATTEMPTS times)
+// ---------------------------------------------------------------------------
+
+async fn try_start(
+    cfg: &Config,
+    config_path: &str,
+    log_level_handle: hc_logging::LogLevelHandle,
+    mqtt_log_handle: plugin_sdk_rs::mqtt_log_layer::MqttLogHandle,
+) -> Result<()> {
+    // --- HomeCore MQTT (via SDK) ----------------------------------------------
+    let sdk_config = PluginConfig {
+        broker_host: cfg.homecore.broker_host.clone(),
+        broker_port: cfg.homecore.broker_port,
+        plugin_id:   cfg.homecore.plugin_id.clone(),
+        password:    cfg.homecore.password.clone(),
+    };
+
+    let client = PluginClient::connect(sdk_config).await?;
+    mqtt_log_handle.connect(
+        client.mqtt_client(),
+        &cfg.homecore.plugin_id,
+        &cfg.logging.log_forward_level,
+    );
+    let publisher = client.device_publisher();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<(String, serde_json::Value)>(256);
+
+    // Enable management protocol (heartbeat + remote config/log commands).
+    let mgmt = client
+        .enable_management(
+            60,
+            Some(env!("CARGO_PKG_VERSION").to_string()),
+            Some(config_path.to_string()),
+            Some(log_level_handle),
+        )
+        .await?;
+
+    // Start the SDK event loop FIRST so the MQTT eventloop is pumping while
+    // we register devices.  Without this, queued publishes block forever once
+    // the rumqttc internal buffer fills up.
+    let cmd_tx_clone = cmd_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = client
+            .run_managed(
+                move |device_id, payload| {
+                    let _ = cmd_tx_clone.try_send((device_id, payload));
+                },
+                mgmt,
+            )
+            .await
+        {
+            error!(error = %e, "SDK event loop exited with error");
+        }
+    });
+
+    // Brief yield to let the eventloop connect before we start publishing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    info!(
+        config      = %config_path,
+        plugin_id   = %cfg.homecore.plugin_id,
+        broker_host = %cfg.homecore.broker_host,
+        broker_port = cfg.homecore.broker_port,
+        server_url  = %cfg.server.url,
+        "hc-zwave connected",
+    );
+
+    // --- Bridge loop (reconnects on WS disconnect) ---
+    Bridge {
+        config: cfg.clone(),
+        published_ids_cache_path: published_ids_cache_path(config_path),
+        publisher,
+        cmd_rx,
+    }
+    .run()
+    .await
 }
 
 fn published_ids_cache_path(config_path: &str) -> PathBuf {

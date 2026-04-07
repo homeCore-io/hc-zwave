@@ -58,6 +58,11 @@ pub struct LoggingConfig {
     /// Delete rotated log files older than this many days.  0 = never prune.
     #[serde(default)]
     pub prune_after_days: u32,
+    /// Minimum log level forwarded to the HomeCore broker over MQTT.
+    /// Logs below this level are only written to the local file / stderr.
+    /// "info" (default) | "warn" | "debug" | "error" | "off"
+    #[serde(default = "default_level")]
+    pub log_forward_level: String,
 }
 
 impl Default for LoggingConfig {
@@ -68,6 +73,7 @@ impl Default for LoggingConfig {
             max_size_mb: default_max_size_mb(),
             compress:    default_compress(),
             prune_after_days: 0,
+            log_forward_level: default_level(),
         }
     }
 }
@@ -274,7 +280,7 @@ pub fn init_logging(
     prefix:         &str,
     stderr_default: &str,
     cfg:            &LoggingConfig,
-) -> tracing_appender::non_blocking::WorkerGuard {
+) -> (tracing_appender::non_blocking::WorkerGuard, hc_logging::LogLevelHandle, plugin_sdk_rs::mqtt_log_layer::MqttLogHandle) {
     let log_dir = Path::new(config_path)
         .parent()
         .and_then(|p| p.parent())
@@ -297,27 +303,42 @@ pub fn init_logging(
 
     // When RUST_LOG is not set: use cfg.level if the user changed it from the
     // default, otherwise fall back to the plugin-specific default filter string.
-    let stderr_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if cfg.level == "info" {
-            stderr_default.parse().unwrap_or_else(|_| EnvFilter::new("info"))
-        } else {
-            EnvFilter::new(&cfg.level)
-        }
-    });
+    let initial_directives = if std::env::var("RUST_LOG").is_ok() {
+        std::env::var("RUST_LOG").unwrap_or_default()
+    } else if cfg.level == "info" {
+        stderr_default.to_string()
+    } else {
+        cfg.level.clone()
+    };
+
+    let global_filter: EnvFilter = initial_directives
+        .parse()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let (reload_layer, reload_handle) =
+        tracing_subscriber::reload::Layer::new(global_filter);
 
     let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(stderr_filter);
+        .with_writer(std::io::stderr);
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_filter(EnvFilter::new("debug"));
 
+    // MQTT log forwarding layer — starts inactive, activated after MQTT connects.
+    let (mqtt_layer, mqtt_handle) = plugin_sdk_rs::mqtt_log_layer::MqttLogLayer::new();
+
     tracing_subscriber::registry()
+        .with(reload_layer)
         .with(stderr_layer)
         .with(file_layer)
+        .with(mqtt_layer)
         .init();
 
-    guard
+    let level_handle = hc_logging::LogLevelHandle::from_reload_handle(
+        reload_handle,
+        initial_directives,
+    );
+
+    (guard, level_handle, mqtt_handle)
 }

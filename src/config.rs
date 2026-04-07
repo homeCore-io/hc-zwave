@@ -9,10 +9,12 @@ use serde::Deserialize;
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub homecore: HomecoreConfig,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub logging: crate::logging::LoggingConfig,
 }
 
 impl Config {
@@ -28,7 +30,7 @@ impl Config {
 // [homecore] — MQTT broker connection and plugin identity
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HomecoreConfig {
     #[serde(default = "default_broker_host")]
     pub broker_host: String,
@@ -48,7 +50,7 @@ fn default_plugin_id()   -> String { "plugin.zwave".into() }
 // [server] — zwave-js-server WebSocket endpoint
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// WebSocket URL of the zwave-js-server, e.g. `"ws://localhost:3000"`.
     pub url: String,

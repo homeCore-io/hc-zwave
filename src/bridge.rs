@@ -2,15 +2,15 @@
 //!
 //! # Flow
 //!
-//! 1. Connect MQTT → subscribe `homecore/devices/zwave_+/cmd`
-//! 2. Connect WebSocket → handshake (set_api_schema → start_listening)
-//! 3. Publish full state for all nodes from the start_listening result
+//! 1. Connect WebSocket → handshake (set_api_schema → start_listening)
+//! 2. Publish full state for all nodes from the start_listening result
+//! 3. Subscribe to commands for each device via DevicePublisher
 //! 4. Event loop:
-//!    - WS `value updated`       → translate → `homecore/devices/zwave_N/state/partial`
-//!    - WS `node status changed` → `homecore/devices/zwave_N/availability`
+//!    - WS `value updated`       → translate → partial state via DevicePublisher
+//!    - WS `node status changed` → availability via DevicePublisher
 //!    - WS `node name updated`   → partial state `{"name": "..."}`
 //!    - WS `node ready`          → republish full node state
-//!    - MQTT cmd                 → `node.set_value` WebSocket command
+//!    - SDK cmd channel          → `node.set_value` WebSocket command
 //! 5. Reconnect on WS disconnect with exponential back-off
 
 use crate::config::Config;
@@ -18,7 +18,7 @@ use crate::translator::{property_key_str, Translator};
 use crate::types::{NodeState, NodeValue, ResultMsg, ServerMsg, ValueUpdatedArgs};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use plugin_sdk_rs::DevicePublisher;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,113 +27,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const PLUGIN_SOURCE: &str = "hc-zwave";
-
 // ---------------------------------------------------------------------------
-// MQTT helpers
+// Published-IDs cache
 // ---------------------------------------------------------------------------
-
-async fn connect_mqtt(cfg: &Config) -> Result<(AsyncClient, EventLoop)> {
-    let mut opts = MqttOptions::new(&cfg.homecore.plugin_id, &cfg.homecore.broker_host, cfg.homecore.broker_port);
-    opts.set_keep_alive(Duration::from_secs(30));
-    opts.set_clean_session(true);
-    if !cfg.homecore.password.is_empty() {
-        opts.set_credentials(&cfg.homecore.plugin_id, &cfg.homecore.password);
-    }
-    let (client, eventloop) = AsyncClient::new(opts, 128);
-    Ok((client, eventloop))
-}
-
-async fn publish_state(client: &AsyncClient, device_id: &str, state: &Value) -> Result<()> {
-    let topic = format!("homecore/devices/{device_id}/state");
-    let payload = with_default_change(state);
-    client
-        .publish(&topic, QoS::AtLeastOnce, true, serde_json::to_vec(&payload)?)
-        .await
-        .context("publish state")?;
-    Ok(())
-}
-
-async fn publish_partial(client: &AsyncClient, device_id: &str, patch: &Value) -> Result<()> {
-    let topic = format!("homecore/devices/{device_id}/state/partial");
-    let payload = with_default_change(patch);
-    client
-        .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
-        .await
-        .context("publish partial")?;
-    Ok(())
-}
-
-fn with_default_change(payload: &Value) -> Value {
-    if payload
-        .get("_hc")
-        .and_then(|v| v.get("change"))
-        .is_some()
-    {
-        return payload.clone();
-    }
-
-    let mut payload = match payload.clone() {
-        Value::Object(map) => map,
-        other => return other,
-    };
-    let mut hc = payload
-        .remove("_hc")
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    hc.insert(
-        "change".to_string(),
-        json!({
-            "kind": "external",
-            "source": PLUGIN_SOURCE,
-        }),
-    );
-    payload.insert("_hc".to_string(), Value::Object(hc));
-    Value::Object(payload)
-}
-
-async fn publish_availability(client: &AsyncClient, device_id: &str, available: bool) -> Result<()> {
-    let topic = format!("homecore/devices/{device_id}/availability");
-    let payload = if available { "online" } else { "offline" };
-    client
-        .publish(&topic, QoS::AtLeastOnce, true, payload.as_bytes())
-        .await
-        .context("publish availability")?;
-    Ok(())
-}
-
-async fn clear_retained_topic(client: &AsyncClient, topic: String) -> Result<()> {
-    client
-        .publish(topic, QoS::AtLeastOnce, true, Vec::<u8>::new())
-        .await
-        .context("clear retained topic")?;
-    Ok(())
-}
-
-async fn unregister_device(
-    client: &AsyncClient,
-    plugin_id: &str,
-    device_id: &str,
-) -> Result<()> {
-    clear_retained_topic(client, format!("homecore/devices/{device_id}/state")).await?;
-    clear_retained_topic(client, format!("homecore/devices/{device_id}/availability")).await?;
-    clear_retained_topic(client, format!("homecore/devices/{device_id}/schema")).await?;
-
-    let payload = json!({
-        "device_id": device_id,
-        "plugin_id": plugin_id,
-    });
-    client
-        .publish(
-            format!("homecore/plugins/{plugin_id}/unregister"),
-            QoS::AtLeastOnce,
-            false,
-            serde_json::to_vec(&payload)?,
-        )
-        .await
-        .context("unregister_device failed")?;
-    Ok(())
-}
 
 fn load_published_ids(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
@@ -145,26 +41,6 @@ fn load_published_ids(path: &Path) -> Vec<String> {
 fn save_published_ids(path: &Path, device_ids: &[String]) -> Result<()> {
     let payload = serde_json::to_vec_pretty(device_ids)?;
     std::fs::write(path, payload)?;
-    Ok(())
-}
-
-async fn register_node(
-    client: &AsyncClient,
-    plugin_id: &str,
-    device_id: &str,
-    name: &str,
-) -> Result<()> {
-    let topic = format!("homecore/plugins/{plugin_id}/register");
-    let payload = serde_json::json!({
-        "device_id": device_id,
-        "plugin_id": plugin_id,
-        "name":      name,
-        "device_type": "zwave",
-    });
-    client
-        .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
-        .await
-        .context("register_node failed")?;
     Ok(())
 }
 
@@ -216,10 +92,10 @@ fn translate_node_value(
     }
 }
 
-async fn publish_node(client: &AsyncClient, plugin_id: &str, node: &NodeState, translator: &Translator) -> Result<()> {
+async fn publish_node(publisher: &DevicePublisher, node: &NodeState, translator: &Translator) -> Result<()> {
     let device_id = node_device_id(node.node_id);
     let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
-    register_node(client, plugin_id, &device_id, &display_name).await?;
+    publisher.register_device_full(&device_id, &display_name, Some("zwave"), None, None).await?;
 
     // Diagnostic: log all CC 98 (Door Lock) value IDs so we can see exactly what the
     // device reports and verify the write target (targetMode) exists on this node.
@@ -238,8 +114,9 @@ async fn publish_node(client: &AsyncClient, plugin_id: &str, node: &NodeState, t
     }
 
     let state = build_state(node, translator);
-    publish_state(client, &device_id, &state).await?;
-    publish_availability(client, &device_id, node.is_available()).await?;
+    publisher.publish_state(&device_id, &state).await?;
+    publisher.publish_availability(&device_id, node.is_available()).await?;
+    publisher.subscribe_commands(&device_id).await?;
     debug!(node_id = node.node_id, device_id, "Published full node state");
     Ok(())
 }
@@ -366,7 +243,7 @@ async fn handshake(
 // Main bridge loop
 // ---------------------------------------------------------------------------
 
-/// Messages sent from the MQTT task to the WS task to trigger `node.set_value`.
+/// Messages sent from the command channel to the WS task to trigger `node.set_value`.
 #[derive(Debug)]
 struct SetValueCmd {
     node_id: u32,
@@ -379,10 +256,12 @@ struct SetValueCmd {
 pub struct Bridge {
     pub config: Config,
     pub published_ids_cache_path: PathBuf,
+    pub publisher: DevicePublisher,
+    pub cmd_rx: mpsc::Receiver<(String, Value)>,
 }
 
 impl Bridge {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let mut backoff_secs = 2u64;
         loop {
             match self.run_once().await {
@@ -400,26 +279,8 @@ impl Bridge {
         Ok(())
     }
 
-    async fn run_once(&self) -> Result<()> {
+    async fn run_once(&mut self) -> Result<()> {
         let cfg = &self.config;
-
-        // --- MQTT ---
-        let (mqtt_client, mut eventloop) = connect_mqtt(cfg).await?;
-
-        // Drain eventloop until we get the ConnAck so subscriptions are live.
-        // Subscribe to all device cmd topics; handle_mqtt_cmd filters to zwave_* devices.
-        // NOTE: MQTT '+' must occupy a full topic level — "zwave_+" is NOT valid.
-        mqtt_client
-            .subscribe("homecore/devices/+/cmd", QoS::AtLeastOnce)
-            .await?;
-        loop {
-            match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(_))) => break,
-                Ok(_) => {}
-                Err(e) => bail!("MQTT connect error: {e}"),
-            }
-        }
-        info!(broker_host = %cfg.homecore.broker_host, broker_port = cfg.homecore.broker_port, "MQTT connected");
 
         // --- WebSocket ---
         let (ws_stream, _) = connect_async(&cfg.server.url)
@@ -435,39 +296,41 @@ impl Bridge {
             .map(|node| node_device_id(node.node_id))
             .collect();
 
-        // --- Publish initial state ---
-        let plugin_id = &cfg.homecore.plugin_id;
+        // --- Unregister stale devices ---
+        let plugin_id = self.publisher.plugin_id().to_string();
         for stale_id in load_published_ids(&self.published_ids_cache_path)
             .into_iter()
             .filter(|device_id| !current_ids.iter().any(|current| current == device_id))
         {
-            if let Err(e) = unregister_device(&mqtt_client, plugin_id, &stale_id).await {
+            if let Err(e) = self.publisher.unregister_device(&plugin_id, &stale_id).await {
                 warn!(device_id = %stale_id, error = %e, "Failed to unregister stale Z-Wave device");
             } else {
                 info!(device_id = %stale_id, "Unregistered stale Z-Wave device");
             }
         }
+
+        // --- Publish initial state + subscribe to commands ---
         for node in &nodes {
-            if let Err(e) = publish_node(&mqtt_client, plugin_id, node, &translator).await {
+            if let Err(e) = publish_node(&self.publisher, node, &translator).await {
                 warn!(node_id = node.node_id, error = %e, "Failed to publish initial node state");
             }
         }
         save_published_ids(&self.published_ids_cache_path, &current_ids)?;
 
-        // --- Command channel: MQTT reader → WS sender ---
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<SetValueCmd>(64);
+        // --- Command channel: SDK cmd_rx → WS sender ---
+        let (sv_tx, mut sv_rx) = mpsc::channel::<SetValueCmd>(64);
 
-        // Spawn the WS task (owns ws_tx + ws_rx, reads cmd_rx, writes MQTT)
-        let mqtt_c = mqtt_client.clone();
-        let plugin_id_owned = cfg.homecore.plugin_id.clone();
+        // Spawn the WS task (owns ws_tx + ws_rx, reads sv_rx, writes MQTT via publisher)
+        let publisher_clone = self.publisher.clone();
         let ws_task = tokio::spawn(async move {
-            ws_event_loop(&mut ws_tx, &mut ws_rx, &mut cmd_rx, &mqtt_c, &translator, &plugin_id_owned).await
+            ws_event_loop(&mut ws_tx, &mut ws_rx, &mut sv_rx, &publisher_clone, &translator).await
         });
 
-        // MQTT event loop in current task (reads cmd topic, sends to cmd_tx)
-        let mqtt_result = mqtt_event_loop(&mut eventloop, &cmd_tx).await;
+        // Read commands from the SDK event loop, translate to SetValueCmd, send to WS task
+        let cmd_translator = Translator::new();
+        let cmd_result = cmd_dispatch_loop(&mut self.cmd_rx, &sv_tx, &cmd_translator).await;
         ws_task.abort();
-        mqtt_result
+        cmd_result
     }
 }
 
@@ -479,9 +342,8 @@ async fn ws_event_loop(
     ws_tx: &mut WsSink,
     ws_rx: &mut WsStream,
     cmd_rx: &mut mpsc::Receiver<SetValueCmd>,
-    mqtt: &AsyncClient,
+    publisher: &DevicePublisher,
     translator: &Translator,
-    plugin_id: &str,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -489,7 +351,7 @@ async fn ws_event_loop(
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_ws_message(&text, mqtt, translator, plugin_id).await {
+                        if let Err(e) = handle_ws_message(&text, publisher, translator).await {
                             warn!(error = %e, "Error handling WS message");
                         }
                     }
@@ -500,7 +362,7 @@ async fn ws_event_loop(
                     None => bail!("WS stream ended"),
                 }
             }
-            // Outgoing command from MQTT
+            // Outgoing command from command channel
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(c) => {
@@ -516,7 +378,7 @@ async fn ws_event_loop(
     Ok(())
 }
 
-async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translator, plugin_id: &str) -> Result<()> {
+async fn handle_ws_message(text: &str, publisher: &DevicePublisher, translator: &Translator) -> Result<()> {
     let msg: ServerMsg = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -526,7 +388,7 @@ async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translat
     };
 
     match msg {
-        ServerMsg::Event(wrapper) => handle_event(wrapper.event, mqtt, translator, plugin_id).await?,
+        ServerMsg::Event(wrapper) => handle_event(wrapper.event, publisher, translator).await?,
         ServerMsg::Result(r) if !r.success => {
             warn!(
                 message_id = %r.message_id,
@@ -542,9 +404,8 @@ async fn handle_ws_message(text: &str, mqtt: &AsyncClient, translator: &Translat
 
 async fn handle_event(
     ev: crate::types::RawEvent,
-    mqtt: &AsyncClient,
+    publisher: &DevicePublisher,
     translator: &Translator,
-    plugin_id: &str,
 ) -> Result<()> {
     let node_id = match ev.node_id {
         Some(id) => id,
@@ -563,7 +424,7 @@ async fn handle_event(
                     {
                         debug!(node_id, %attr, value = ?val, "Value translated → publishing");
                         let patch = json!({ attr: val });
-                        publish_partial(mqtt, &device_id, &patch).await?;
+                        publisher.publish_state_partial(&device_id, &patch).await?;
                     } else {
                         // Log unmatched sensor CCs at debug so mismatches are diagnosable.
                         let cc = args.command_class;
@@ -588,17 +449,17 @@ async fn handle_event(
             // operation, not an outage.  Only Dead (3) means the node is unreachable.
             let status = ev.args.as_ref().and_then(|a| a.get("status")).and_then(|s| s.as_u64());
             let available = !matches!(status, Some(3));
-            publish_availability(mqtt, &device_id, available).await?;
+            publisher.publish_availability(&device_id, available).await?;
             info!(node_id, ?status, available, "Node status changed");
         }
 
         // Direct node lifecycle events forwarded by zwave-js-server
         "dead" => {
-            publish_availability(mqtt, &device_id, false).await?;
+            publisher.publish_availability(&device_id, false).await?;
             info!(node_id, "Node dead");
         }
         "alive" | "wake up" => {
-            publish_availability(mqtt, &device_id, true).await?;
+            publisher.publish_availability(&device_id, true).await?;
             info!(node_id, event = %ev.event, "Node alive/awake");
         }
         "sleep" => {
@@ -610,11 +471,7 @@ async fn handle_event(
         "node ready" => {
             if let Some(ns_val) = ev.node_state {
                 if let Some(node) = NodeState::from_value(&ns_val) {
-                    let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
-                    register_node(mqtt, plugin_id, &device_id, &display_name).await?;
-                    let state = build_state(&node, translator);
-                    publish_state(mqtt, &device_id, &state).await?;
-                    publish_availability(mqtt, &device_id, node.is_available()).await?;
+                    publish_node(publisher, &node, translator).await?;
                     info!(node_id, "Node ready — published full state");
                 }
             }
@@ -622,9 +479,10 @@ async fn handle_event(
 
         "node name updated" => {
             if let Some(name) = ev.name {
-                register_node(mqtt, plugin_id, &device_id, &name).await?;
+                let display_name = if name.is_empty() { &device_id } else { &name };
+                publisher.register_device_full(&device_id, display_name, Some("zwave"), None, None).await?;
                 let patch = json!({ "name": name });
-                publish_partial(mqtt, &device_id, &patch).await?;
+                publisher.publish_state_partial(&device_id, &patch).await?;
                 debug!(node_id, %name, "Node name updated");
             }
         }
@@ -632,13 +490,14 @@ async fn handle_event(
         "node location updated" => {
             if let Some(loc) = ev.location {
                 let patch = json!({ "location": loc });
-                publish_partial(mqtt, &device_id, &patch).await?;
+                publisher.publish_state_partial(&device_id, &patch).await?;
                 debug!(node_id, %loc, "Node location updated");
             }
         }
 
         "node removed" => {
-            unregister_device(mqtt, plugin_id, &device_id).await?;
+            let plugin_id = publisher.plugin_id().to_string();
+            publisher.unregister_device(&plugin_id, &device_id).await?;
             info!(node_id, "Node removed and unregistered");
         }
 
@@ -674,52 +533,36 @@ async fn send_set_value(ws_tx: &mut WsSink, cmd: &SetValueCmd) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// MQTT event loop
+// Command dispatch loop — reads SDK command channel, translates to SetValueCmd
 // ---------------------------------------------------------------------------
 
-async fn mqtt_event_loop(
-    eventloop: &mut EventLoop,
-    cmd_tx: &mpsc::Sender<SetValueCmd>,
+async fn cmd_dispatch_loop(
+    cmd_rx: &mut mpsc::Receiver<(String, Value)>,
+    sv_tx: &mpsc::Sender<SetValueCmd>,
+    translator: &Translator,
 ) -> Result<()> {
-    let translator = Translator::new();
     loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Packet::Publish(p))) => {
-                handle_mqtt_cmd(&p.topic, &p.payload, &translator, cmd_tx).await;
+        match cmd_rx.recv().await {
+            Some((device_id, cmd)) => {
+                handle_cmd(&device_id, &cmd, translator, sv_tx).await;
             }
-            Ok(_) => {}
-            Err(e) => {
-                bail!("MQTT error: {e}");
-            }
+            None => bail!("SDK command channel closed"),
         }
     }
 }
 
-async fn handle_mqtt_cmd(
-    topic: &str,
-    payload: &[u8],
+async fn handle_cmd(
+    device_id: &str,
+    cmd: &Value,
     translator: &Translator,
-    cmd_tx: &mpsc::Sender<SetValueCmd>,
+    sv_tx: &mpsc::Sender<SetValueCmd>,
 ) {
-    // Topic: homecore/devices/zwave_{nodeId}/cmd
-    let parts: Vec<&str> = topic.split('/').collect();
-    if parts.len() != 4 || parts[3] != "cmd" {
-        return;
-    }
-    let device_segment = parts[2];
-    let node_id: u32 = match device_segment.strip_prefix("zwave_").and_then(|s| s.parse().ok()) {
+    // device_id format: "zwave_{nodeId}"
+    let node_id: u32 = match device_id.strip_prefix("zwave_").and_then(|s| s.parse().ok()) {
         Some(id) => id,
         None => return, // not a zwave device — ignore
     };
     info!(node_id, "Received cmd from HomeCore");
-
-    let cmd: Value = match serde_json::from_slice(payload) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(topic, error = %e, "Non-JSON cmd payload");
-            return;
-        }
-    };
 
     let obj = match cmd.as_object() {
         Some(o) => o,
@@ -742,7 +585,7 @@ async fn handle_mqtt_cmd(
             property: target.property.clone(),
             value: native_value,
         };
-        if cmd_tx.send(sv_cmd).await.is_err() {
+        if sv_tx.send(sv_cmd).await.is_err() {
             warn!("WS task gone; dropping cmd");
         }
     }
