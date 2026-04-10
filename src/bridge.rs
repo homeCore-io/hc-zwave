@@ -87,15 +87,28 @@ fn translate_node_value(
     let pk_str = v.property_key.as_ref().and_then(property_key_str);
     let pk = pk_str.as_deref();
 
-    if let Some((attr, val)) = translator.translate(v.command_class, v.endpoint, &v.property, pk, raw) {
+    if let Some((attr, val)) =
+        translator.translate(v.command_class, v.endpoint, &v.property, pk, raw)
+    {
         map.insert(attr, val);
     }
 }
 
-async fn publish_node(publisher: &DevicePublisher, node: &NodeState, translator: &Translator) -> Result<()> {
+async fn publish_node(
+    publisher: &DevicePublisher,
+    node: &NodeState,
+    translator: &Translator,
+) -> Result<()> {
     let device_id = node_device_id(node.node_id);
-    let display_name = node.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&device_id).to_string();
-    publisher.register_device_full(&device_id, &display_name, Some("zwave"), None, None).await?;
+    let display_name = node
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&device_id)
+        .to_string();
+    publisher
+        .register_device_full(&device_id, &display_name, Some("zwave"), None, None)
+        .await?;
 
     // Diagnostic: log all CC 98 (Door Lock) value IDs so we can see exactly what the
     // device reports and verify the write target (targetMode) exists on this node.
@@ -104,8 +117,16 @@ async fn publish_node(publisher: &DevicePublisher, node: &NodeState, translator:
         .iter()
         .filter(|v| v.command_class == 98)
         .map(|v| {
-            let pk = v.property_key.as_ref().map(|pk| format!("[{pk}]")).unwrap_or_default();
-            let val = v.value.as_ref().map(|val| format!("={val}")).unwrap_or_default();
+            let pk = v
+                .property_key
+                .as_ref()
+                .map(|pk| format!("[{pk}]"))
+                .unwrap_or_default();
+            let val = v
+                .value
+                .as_ref()
+                .map(|val| format!("={val}"))
+                .unwrap_or_default();
             format!("{}{}{}", v.property, pk, val)
         })
         .collect();
@@ -115,9 +136,14 @@ async fn publish_node(publisher: &DevicePublisher, node: &NodeState, translator:
 
     let state = build_state(node, translator);
     publisher.publish_state(&device_id, &state).await?;
-    publisher.publish_availability(&device_id, node.is_available()).await?;
+    publisher
+        .publish_availability(&device_id, node.is_available())
+        .await?;
     publisher.subscribe_commands(&device_id).await?;
-    debug!(node_id = node.node_id, device_id, "Published full node state");
+    debug!(
+        node_id = node.node_id,
+        device_id, "Published full node state"
+    );
     Ok(())
 }
 
@@ -148,10 +174,7 @@ async fn ws_recv_result(rx: &mut WsStream, expected_id: &str) -> Result<ResultMs
                 if let ServerMsg::Result(r) = msg {
                     if r.message_id == expected_id {
                         if !r.success {
-                            bail!(
-                                "zwave-js command {expected_id} failed: {:?}",
-                                r.error_code
-                            );
+                            bail!("zwave-js command {expected_id} failed: {:?}", r.error_code);
                         }
                         return Ok(r);
                     }
@@ -219,7 +242,11 @@ async fn handshake(
 
     // Step 3: start listening — returns full Z-Wave state
     let listen_id = "hc-zwave-listen";
-    ws_send(tx, &json!({ "messageId": listen_id, "command": "start_listening" })).await?;
+    ws_send(
+        tx,
+        &json!({ "messageId": listen_id, "command": "start_listening" }),
+    )
+    .await?;
     let result = ws_recv_result(rx, listen_id).await?;
 
     let nodes = result
@@ -302,7 +329,11 @@ impl Bridge {
             .into_iter()
             .filter(|device_id| !current_ids.iter().any(|current| current == device_id))
         {
-            if let Err(e) = self.publisher.unregister_device(&plugin_id, &stale_id).await {
+            if let Err(e) = self
+                .publisher
+                .unregister_device(&plugin_id, &stale_id)
+                .await
+            {
                 warn!(device_id = %stale_id, error = %e, "Failed to unregister stale Z-Wave device");
             } else {
                 info!(device_id = %stale_id, "Unregistered stale Z-Wave device");
@@ -323,7 +354,14 @@ impl Bridge {
         // Spawn the WS task (owns ws_tx + ws_rx, reads sv_rx, writes MQTT via publisher)
         let publisher_clone = self.publisher.clone();
         let ws_task = tokio::spawn(async move {
-            ws_event_loop(&mut ws_tx, &mut ws_rx, &mut sv_rx, &publisher_clone, &translator).await
+            ws_event_loop(
+                &mut ws_tx,
+                &mut ws_rx,
+                &mut sv_rx,
+                &publisher_clone,
+                &translator,
+            )
+            .await
         });
 
         // Read commands from the SDK event loop, translate to SetValueCmd, send to WS task
@@ -378,7 +416,11 @@ async fn ws_event_loop(
     Ok(())
 }
 
-async fn handle_ws_message(text: &str, publisher: &DevicePublisher, translator: &Translator) -> Result<()> {
+async fn handle_ws_message(
+    text: &str,
+    publisher: &DevicePublisher,
+    translator: &Translator,
+) -> Result<()> {
     let msg: ServerMsg = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -419,9 +461,13 @@ async fn handle_event(
                 if let Ok(args) = serde_json::from_value::<ValueUpdatedArgs>(args_val) {
                     let pk_str = args.property_key.as_ref().and_then(property_key_str);
                     let pk = pk_str.as_deref();
-                    if let Some((attr, val)) =
-                        translator.translate(args.command_class, args.endpoint, &args.property, pk, &args.new_value)
-                    {
+                    if let Some((attr, val)) = translator.translate(
+                        args.command_class,
+                        args.endpoint,
+                        &args.property,
+                        pk,
+                        &args.new_value,
+                    ) {
                         debug!(node_id, %attr, value = ?val, "Value translated → publishing");
                         let patch = json!({ attr: val });
                         publisher.publish_state_partial(&device_id, &patch).await?;
@@ -447,9 +493,15 @@ async fn handle_event(
             // NodeStatus: 0=Unknown, 1=Asleep, 2=Awake, 3=Dead, 4=Alive.
             // Battery sensors regularly go Asleep between readings — that is normal
             // operation, not an outage.  Only Dead (3) means the node is unreachable.
-            let status = ev.args.as_ref().and_then(|a| a.get("status")).and_then(|s| s.as_u64());
+            let status = ev
+                .args
+                .as_ref()
+                .and_then(|a| a.get("status"))
+                .and_then(|s| s.as_u64());
             let available = !matches!(status, Some(3));
-            publisher.publish_availability(&device_id, available).await?;
+            publisher
+                .publish_availability(&device_id, available)
+                .await?;
             info!(node_id, ?status, available, "Node status changed");
         }
 
@@ -480,7 +532,9 @@ async fn handle_event(
         "node name updated" => {
             if let Some(name) = ev.name {
                 let display_name = if name.is_empty() { &device_id } else { &name };
-                publisher.register_device_full(&device_id, display_name, Some("zwave"), None, None).await?;
+                publisher
+                    .register_device_full(&device_id, display_name, Some("zwave"), None, None)
+                    .await?;
                 let patch = json!({ "name": name });
                 publisher.publish_state_partial(&device_id, &patch).await?;
                 debug!(node_id, %name, "Node name updated");
@@ -558,7 +612,10 @@ async fn handle_cmd(
     sv_tx: &mpsc::Sender<SetValueCmd>,
 ) {
     // device_id format: "zwave_{nodeId}"
-    let node_id: u32 = match device_id.strip_prefix("zwave_").and_then(|s| s.parse().ok()) {
+    let node_id: u32 = match device_id
+        .strip_prefix("zwave_")
+        .and_then(|s| s.parse().ok())
+    {
         Some(id) => id,
         None => return, // not a zwave device — ignore
     };

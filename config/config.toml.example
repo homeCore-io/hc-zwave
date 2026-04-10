@@ -1,5 +1,5 @@
 # hc-zwave plugin configuration
-# Copy to config/config.dev.toml and fill in your values.
+# Copy to config/config.toml and fill in your values.
 #
 # Prerequisites:
 #   - ZwaveJS UI (or standalone zwave-js-server) running with WebSocket enabled
