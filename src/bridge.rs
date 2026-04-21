@@ -626,11 +626,19 @@ async fn handle_cmd(
         None => return,
     };
 
+    // HomeCore command metadata keys (`_hc`, top-level `correlation_id`) are
+    // not device attributes — skip them when tallying dispatch outcomes so
+    // the "nothing dispatched" warn doesn't fire on metadata-only noise.
+    let mut dispatched = 0usize;
+    let mut unrecognised: Vec<&str> = Vec::new();
     for (attr, hc_value) in obj {
+        if attr.starts_with('_') || attr == "correlation_id" {
+            continue;
+        }
         let target = match translator.write_target(attr) {
             Some(t) => t,
             None => {
-                debug!(attr, "No write target for attribute — ignoring");
+                unrecognised.push(attr.as_str());
                 continue;
             }
         };
@@ -644,6 +652,24 @@ async fn handle_cmd(
         };
         if sv_tx.send(sv_cmd).await.is_err() {
             warn!("WS task gone; dropping cmd");
+        } else {
+            dispatched += 1;
         }
+    }
+
+    if dispatched == 0 && !unrecognised.is_empty() {
+        // The command had a payload but no attribute mapped to a Z-Wave
+        // writable. Likely a shape mismatch between sender and this plugin.
+        // Surfacing as warn makes silent drops visible.
+        warn!(
+            node_id,
+            attributes = ?unrecognised,
+            "Command had no writable attributes — nothing was dispatched to Z-Wave"
+        );
+    } else if !unrecognised.is_empty() {
+        debug!(
+            attributes = ?unrecognised,
+            "Some command attributes had no write target (others dispatched)"
+        );
     }
 }
