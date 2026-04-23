@@ -14,6 +14,7 @@
 //! 5. Reconnect on WS disconnect with exponential back-off
 
 use crate::config::Config;
+use crate::inclusion::{decode_controller_event, ControllerEvent};
 use crate::translator::{property_key_str, Translator};
 use crate::types::{NodeState, NodeValue, ResultMsg, ServerMsg, ValueUpdatedArgs};
 use anyhow::{bail, Context, Result};
@@ -22,7 +23,7 @@ use plugin_sdk_rs::DevicePublisher;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -285,6 +286,15 @@ pub struct Bridge {
     pub published_ids_cache_path: PathBuf,
     pub publisher: DevicePublisher,
     pub cmd_rx: mpsc::Receiver<(String, Value)>,
+    /// Raw zwave-js-server commands pushed by streaming action handlers
+    /// (include_node, exclude_node). The WS loop drains this into the
+    /// live WebSocket. Long-lived across reconnects — buffer persists
+    /// while the plugin is down.
+    pub control_rx: mpsc::Receiver<Value>,
+    /// Broadcaster for controller-scope events the streaming action
+    /// handlers subscribe to. Cloned into the WS loop; long-lived so
+    /// active subscribers survive reconnects.
+    pub event_tx: broadcast::Sender<ControllerEvent>,
 }
 
 impl Bridge {
@@ -351,24 +361,24 @@ impl Bridge {
         // --- Command channel: SDK cmd_rx → WS sender ---
         let (sv_tx, mut sv_rx) = mpsc::channel::<SetValueCmd>(64);
 
-        // Spawn the WS task (owns ws_tx + ws_rx, reads sv_rx, writes MQTT via publisher)
-        let publisher_clone = self.publisher.clone();
-        let ws_task = tokio::spawn(async move {
-            ws_event_loop(
+        // Everything runs inline under tokio::select so we can borrow
+        // disjoint fields of `self` (cmd_rx, control_rx) mutably. The WS
+        // loop can't be tokio::spawn'd without moving those borrows.
+        let cmd_translator = Translator::new();
+        let publisher = self.publisher.clone();
+        let event_tx = self.event_tx.clone();
+        tokio::select! {
+            res = ws_event_loop(
                 &mut ws_tx,
                 &mut ws_rx,
                 &mut sv_rx,
-                &publisher_clone,
+                &mut self.control_rx,
+                &publisher,
                 &translator,
-            )
-            .await
-        });
-
-        // Read commands from the SDK event loop, translate to SetValueCmd, send to WS task
-        let cmd_translator = Translator::new();
-        let cmd_result = cmd_dispatch_loop(&mut self.cmd_rx, &sv_tx, &cmd_translator).await;
-        ws_task.abort();
-        cmd_result
+                &event_tx,
+            ) => res,
+            res = cmd_dispatch_loop(&mut self.cmd_rx, &sv_tx, &cmd_translator) => res,
+        }
     }
 }
 
@@ -380,8 +390,10 @@ async fn ws_event_loop(
     ws_tx: &mut WsSink,
     ws_rx: &mut WsStream,
     cmd_rx: &mut mpsc::Receiver<SetValueCmd>,
+    control_rx: &mut mpsc::Receiver<Value>,
     publisher: &DevicePublisher,
     translator: &Translator,
+    event_tx: &broadcast::Sender<ControllerEvent>,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -389,7 +401,7 @@ async fn ws_event_loop(
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_ws_message(&text, publisher, translator).await {
+                        if let Err(e) = handle_ws_message(&text, publisher, translator, event_tx).await {
                             warn!(error = %e, "Error handling WS message");
                         }
                     }
@@ -400,7 +412,7 @@ async fn ws_event_loop(
                     None => bail!("WS stream ended"),
                 }
             }
-            // Outgoing command from command channel
+            // Outgoing SetValueCmd from the device command path
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(c) => {
@@ -409,6 +421,21 @@ async fn ws_event_loop(
                         }
                     }
                     None => break, // sender dropped
+                }
+            }
+            // Raw control JSON from streaming action handlers
+            // (include_node, exclude_node).
+            ctrl = control_rx.recv() => {
+                match ctrl {
+                    Some(msg) => {
+                        if let Err(e) = ws_send(ws_tx, &msg).await {
+                            warn!(error = %e, cmd = ?msg.get("command"), "Failed to send control command");
+                        }
+                    }
+                    None => {
+                        // Control channel closed (bridge being torn down).
+                        // Continue so we don't prematurely exit the WS loop.
+                    }
                 }
             }
         }
@@ -420,6 +447,7 @@ async fn handle_ws_message(
     text: &str,
     publisher: &DevicePublisher,
     translator: &Translator,
+    event_tx: &broadcast::Sender<ControllerEvent>,
 ) -> Result<()> {
     let msg: ServerMsg = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -430,7 +458,18 @@ async fn handle_ws_message(
     };
 
     match msg {
-        ServerMsg::Event(wrapper) => handle_event(wrapper.event, publisher, translator).await?,
+        ServerMsg::Event(wrapper) => {
+            // Broadcast controller-scope events for streaming handlers
+            // (include_node / exclude_node). Node-scope events keep
+            // flowing through the existing handle_event pipeline.
+            if let Some(ctrl_ev) = decode_controller_event(&wrapper.event) {
+                // Ignore send failures — broadcast returns an error only
+                // when there are no subscribers, which is the normal
+                // case between inclusion sessions.
+                let _ = event_tx.send(ctrl_ev);
+            }
+            handle_event(wrapper.event, publisher, translator).await?
+        }
         ServerMsg::Result(r) if !r.success => {
             warn!(
                 message_id = %r.message_id,

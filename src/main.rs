@@ -13,6 +13,7 @@
 
 mod bridge;
 mod config;
+mod inclusion;
 mod logging;
 mod translator;
 mod types;
@@ -123,7 +124,13 @@ async fn try_start(
     let publisher = client.device_publisher();
     let (cmd_tx, cmd_rx) = mpsc::channel::<(String, serde_json::Value)>(256);
 
-    // Enable management protocol (heartbeat + remote config/log commands).
+    // Inclusion / exclusion streaming channels. The handle is cloned
+    // into every streaming action closure; the bridge drains the raw
+    // control channel and publishes decoded controller events.
+    let (inclusion_handle, control_rx, event_tx) = inclusion::new_handle();
+
+    // Enable management protocol (heartbeat + remote config/log commands,
+    // plus streaming include_node + exclude_node actions).
     let mgmt = client
         .enable_management(
             60,
@@ -131,7 +138,9 @@ async fn try_start(
             Some(config_path.to_string()),
             Some(log_level_handle),
         )
-        .await?;
+        .await?
+        .with_capabilities(capabilities_manifest());
+    let mgmt = inclusion::register_actions(mgmt, inclusion_handle);
 
     // Start the SDK event loop FIRST so the MQTT eventloop is pumping while
     // we register devices.  Without this, queued publishes block forever once
@@ -169,9 +178,66 @@ async fn try_start(
         published_ids_cache_path: published_ids_cache_path(config_path),
         publisher,
         cmd_rx,
+        control_rx,
+        event_tx,
     }
     .run()
     .await
+}
+
+/// Capability manifest for hc-zwave. Declares the streaming actions
+/// (include_node, exclude_node) so the admin UI and hc-mcp can surface
+/// them without plugin-specific code.
+fn capabilities_manifest() -> hc_types::Capabilities {
+    use hc_types::{Action, Capabilities, Concurrency, ItemOp, RequiresRole};
+    use serde_json::json;
+
+    Capabilities {
+        spec: "1".into(),
+        plugin_id: String::new(), // SDK fills in from plugin_id
+        actions: vec![
+            Action {
+                id: "include_node".into(),
+                label: "Include Z-Wave device".into(),
+                description: Some(
+                    "Put the controller into inclusion mode and add one or more \
+                     Z-Wave devices. Reply 'done' when finished, or cancel to \
+                     abort. Secure S2 inclusion auto-grants the device's \
+                     requested classes; devices requiring DSK PIN entry are \
+                     not supported in v1."
+                        .into(),
+                ),
+                params: None,
+                result: Some(json!({ "nodes_added": { "type": "array" } })),
+                stream: true,
+                cancelable: true,
+                concurrency: Concurrency::Single,
+                item_key: Some("node_id".into()),
+                item_operations: Some(vec![ItemOp::Add, ItemOp::Update]),
+                requires_role: RequiresRole::Admin,
+                timeout_ms: Some(300_000), // 5 min — inclusion windows can be long
+            },
+            Action {
+                id: "exclude_node".into(),
+                label: "Exclude Z-Wave device".into(),
+                description: Some(
+                    "Put the controller into exclusion mode and remove one or \
+                     more Z-Wave devices. Reply 'done' when finished, or \
+                     cancel to abort."
+                        .into(),
+                ),
+                params: None,
+                result: Some(json!({ "nodes_removed": { "type": "array" } })),
+                stream: true,
+                cancelable: true,
+                concurrency: Concurrency::Single,
+                item_key: Some("node_id".into()),
+                item_operations: Some(vec![ItemOp::Remove]),
+                requires_role: RequiresRole::Admin,
+                timeout_ms: Some(300_000),
+            },
+        ],
+    }
 }
 
 fn published_ids_cache_path(config_path: &str) -> PathBuf {

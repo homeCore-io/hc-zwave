@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 plugin-sdk-rs      = { path = "../../sdks/hc-plugin-sdk-rs" }
+hc-types           = { path = "../../core/crates/hc-types" }
 hc-logging         = { path = "../../core/crates/hc-logging" }
 tokio              = { version = "1", features = ["full"] }
 tokio-tungstenite  = "0.24"

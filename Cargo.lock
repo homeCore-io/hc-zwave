@@ -372,6 +372,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hc-logging",
+ "hc-types",
  "plugin-sdk-rs",
  "rumqttc",
  "serde",
