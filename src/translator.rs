@@ -278,28 +278,100 @@ static ALIAS_TABLE: &[AliasEntry] = &[
         transform: Transform::Identity,
         is_write: false,
     },
-    // Meter (CC 50) — read-only, propertyKey-based
+    // Meter (CC 50) — read-only, propertyKey-encoded.
+    //
+    // zwave-js encodes the Meter Report ValueID's propertyKey as
+    //
+    //     (meterType << 16) | (scale << 8) | rateType
+    //
+    // For Electric Meter (meterType=1), rateType=Consumed (1):
+    //     scale 0 (kWh)        → 0x10001 = 65537
+    //     scale 1 (kVAh)       → 0x10101 = 65793
+    //     scale 2 (W)          → 0x10201 = 66049
+    //     scale 3 (pulse cnt)  → 0x10301 = 66305
+    //     scale 4 (V)          → 0x10401 = 66561
+    //     scale 5 (A)          → 0x10501 = 66817
+    //     scale 6 (PowerFactor)→ 0x10601 = 67073
+    //     scale 7 (kVar)       → 0x10701 = 67329
+    //     scale 8 (kVarh)      → 0x10801 = 67585
+    //
+    // For solar/PV setups rateType=Produced (2) gives parallel keys:
+    //     scale 0 (kWh exported) → 0x10002 = 65538
+    //     scale 2 (W exported)   → 0x10202 = 66050
+    //     etc.
+    //
+    // Anything not aliased here lands via `synthetic_attr_name` as
+    // `cc50_value_pk<key>` so the value is still visible.
+    //
+    // History note: the original 65537/65538/65539/65540 aliases mapped
+    // each propertyKey to a different unit (W/kWh/V/A) — that was wrong;
+    // those keys are actually kWh at varying rate types. Verified against
+    // a real Meter v3 device (node 47, screenshot 2026-04-24) and the
+    // zwave-js encoding documented above.
     AliasEntry {
         key: "50/0/value/65537",
-        attribute: "power_w",
-        transform: Transform::Identity,
-        is_write: false,
-    },
-    AliasEntry {
-        key: "50/0/value/65538",
         attribute: "energy_kwh",
         transform: Transform::Identity,
         is_write: false,
     },
     AliasEntry {
-        key: "50/0/value/65539",
+        key: "50/0/value/65793",
+        attribute: "apparent_energy_kvah",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/66049",
+        attribute: "power_w",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/66305",
+        attribute: "pulse_count",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/66561",
         attribute: "voltage",
         transform: Transform::Identity,
         is_write: false,
     },
     AliasEntry {
-        key: "50/0/value/65540",
+        key: "50/0/value/66817",
         attribute: "current_a",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/67073",
+        attribute: "power_factor",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/67329",
+        attribute: "reactive_power_kvar",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/67585",
+        attribute: "reactive_energy_kvarh",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    // Solar / PV — rateType=Produced parallels (kWh exported, W exported).
+    AliasEntry {
+        key: "50/0/value/65538",
+        attribute: "energy_kwh_exported",
+        transform: Transform::Identity,
+        is_write: false,
+    },
+    AliasEntry {
+        key: "50/0/value/66050",
+        attribute: "power_w_exported",
         transform: Transform::Identity,
         is_write: false,
     },
@@ -567,6 +639,47 @@ impl Translator {
     }
 }
 
+/// Deterministic attribute name for a value with no alias entry. Used so
+/// every z-wave value the device exposes is at least visible — without
+/// this, unmapped command classes silently drop. Naming convention:
+///
+///   `cc{cc}_e{endpoint}_{property}[_pk{key}]`
+///
+/// Endpoint is omitted when 0 (the default root endpoint) so common
+/// values stay short. Property is normalized to snake_case ASCII; any
+/// other characters become `_`.
+pub fn synthetic_attr_name(
+    cc: u32,
+    endpoint: u32,
+    property: &str,
+    property_key: Option<&str>,
+) -> String {
+    let prop_safe = sanitize_segment(property);
+    let mut name = if endpoint == 0 {
+        format!("cc{cc}_{prop_safe}")
+    } else {
+        format!("cc{cc}_e{endpoint}_{prop_safe}")
+    };
+    if let Some(pk) = property_key {
+        let pk_safe = sanitize_segment(pk);
+        name.push_str("_pk");
+        name.push_str(&pk_safe);
+    }
+    name
+}
+
+fn sanitize_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Stringify a `propertyKey` Value for use in alias keys.
 /// Returns `None` if the key is null/absent (omit from key).
 pub fn property_key_str(pk: &Value) -> Option<String> {
@@ -621,11 +734,28 @@ mod tests {
     #[test]
     fn meter_propertykey() {
         let t = Translator::new();
+        // 65537 = (meterType=1 << 16) | (scale=0 << 8) | (rateType=1=Consumed)
+        // → Electric kWh consumed.
         let (attr, val) = t
-            .translate(50, 0, "value", Some("65537"), &serde_json::json!(120.5))
+            .translate(50, 0, "value", Some("65537"), &serde_json::json!(0.002))
+            .unwrap();
+        assert_eq!(attr, "energy_kwh");
+        assert_eq!(val, serde_json::json!(0.002));
+        // 66049 = (1<<16)|(2<<8)|1 → Electric W consumed.
+        let (attr, _) = t
+            .translate(50, 0, "value", Some("66049"), &serde_json::json!(120.5))
             .unwrap();
         assert_eq!(attr, "power_w");
-        assert_eq!(val, serde_json::json!(120.5));
+        // 66561 = (1<<16)|(4<<8)|1 → Electric V consumed.
+        let (attr, _) = t
+            .translate(50, 0, "value", Some("66561"), &serde_json::json!(120.077))
+            .unwrap();
+        assert_eq!(attr, "voltage");
+        // 67073 = (1<<16)|(6<<8)|1 → Electric PowerFactor.
+        let (attr, _) = t
+            .translate(50, 0, "value", Some("67073"), &serde_json::json!(0.95))
+            .unwrap();
+        assert_eq!(attr, "power_factor");
     }
 
     #[test]
@@ -644,6 +774,25 @@ mod tests {
         assert!(t
             .translate(999, 0, "unknownProp", None, &Value::Bool(true))
             .is_none());
+    }
+
+    #[test]
+    fn synthetic_name_matches_alias_shape() {
+        // Endpoint 0 stays compact.
+        assert_eq!(
+            synthetic_attr_name(50, 0, "value", Some("65541")),
+            "cc50_value_pk65541"
+        );
+        // Non-zero endpoint is preserved.
+        assert_eq!(
+            synthetic_attr_name(49, 1, "Air temperature", None),
+            "cc49_e1_air_temperature"
+        );
+        // Unsafe characters in property are sanitised.
+        assert_eq!(
+            synthetic_attr_name(113, 0, "Home Security[2]", Some("Sensor")),
+            "cc113_home_security_2__pksensor"
+        );
     }
 
     #[test]

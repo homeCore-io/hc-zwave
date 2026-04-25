@@ -39,10 +39,26 @@ pub enum ControllerEvent {
     ExclusionFailed { message: Option<String> },
     /// A node was added to the network. `raw` carries whatever zwave-js
     /// sends in the `node` payload (id, manufacturer, device type, etc.)
-    /// so the UI can surface richer metadata. Usually followed later by
-    /// a `node ready` once the interview finishes.
+    /// so the UI can surface richer metadata. Usually followed by a
+    /// pair of `interview started` / `node ready` events as the device
+    /// completes its interview.
     NodeAdded { node_id: u32, raw: Value },
     NodeRemoved { node_id: u32 },
+    /// zwave-js has begun interviewing a freshly-added node. Used to flip
+    /// the inclusion item from `interviewing` (its initial post-add state)
+    /// to a more informative label.
+    NodeInterviewStarted { node_id: u32 },
+    /// Interview finished — node is fully ready. `raw` is the `nodeState`
+    /// payload zwave-js attaches to `node ready`, suitable for upserting
+    /// into the inclusion item with richer fields (firmware, name, etc.).
+    NodeReady { node_id: u32, raw: Value },
+    /// Interview failed; the node may still be partially usable but the
+    /// inclusion UI should mark the item as failed rather than stuck on
+    /// "interviewing" forever.
+    NodeInterviewFailed {
+        node_id: u32,
+        message: Option<String>,
+    },
     /// S2 bootstrap asking the client which security classes to grant.
     /// Plugin auto-accepts all requested classes in v1.
     GrantSecurityClasses { request_id: String, requested: Value },
@@ -62,6 +78,10 @@ pub enum ControllerEvent {
 pub struct InclusionHandle {
     control_tx: mpsc::Sender<Value>,
     events: broadcast::Sender<ControllerEvent>,
+    /// Pings the bridge's rescan path so a freshly-completed inclusion
+    /// can refresh device registrations without the user manually
+    /// invoking `rescan_nodes`.
+    rescan_tx: mpsc::Sender<()>,
 }
 
 impl InclusionHandle {
@@ -77,30 +97,82 @@ impl InclusionHandle {
             .await
             .map_err(|_| anyhow!("inclusion control channel closed; bridge not running"))
     }
+
+    /// Ask the bridge to rescan all nodes from zwave-js and republish
+    /// their registrations. Best-effort — if the channel is full or the
+    /// bridge isn't running we just drop the request.
+    pub fn request_rescan(&self) {
+        let _ = self.rescan_tx.try_send(());
+    }
 }
 
 /// Create the inclusion handle + the bridge-side receiver ends it needs.
-/// `control_rx` is consumed by the bridge's WS loop; `events_sender` is
-/// how the bridge publishes decoded controller events.
-pub fn new_handle() -> (InclusionHandle, mpsc::Receiver<Value>, broadcast::Sender<ControllerEvent>)
-{
+/// `control_rx` is consumed by the bridge's WS loop; `events_tx` is how
+/// the bridge publishes decoded controller events; `rescan_tx` is the
+/// post-inclusion auto-rescan trigger that mirrors the manifest's
+/// `rescan_nodes` action.
+pub fn new_handle(
+    rescan_tx: mpsc::Sender<()>,
+) -> (
+    InclusionHandle,
+    mpsc::Receiver<Value>,
+    broadcast::Sender<ControllerEvent>,
+) {
     let (control_tx, control_rx) = mpsc::channel::<Value>(32);
     let (events_tx, _events_rx) = broadcast::channel::<ControllerEvent>(128);
     let handle = InclusionHandle {
         control_tx,
         events: events_tx.clone(),
+        rescan_tx,
     };
     (handle, control_rx, events_tx)
 }
 
-/// Best-effort decode of a zwave-js-server controller event frame into a
+/// Best-effort decode of a zwave-js-server event frame into a
 /// [`ControllerEvent`]. Returns `None` for frames we don't care about.
+///
+/// Both controller-scope and node-scope events are handled — the latter
+/// drives item lifecycle updates during an inclusion session (interview
+/// progress, ready, failed). Node-scope events also keep flowing through
+/// `bridge::handle_event` for state publishing; the broadcast here is
+/// purely additive.
 pub fn decode_controller_event(ev: &crate::types::RawEvent) -> Option<ControllerEvent> {
-    // Only controller-scope events matter here; node-scope events (value
-    // updated, node ready, etc.) keep flowing through the existing path.
-    if ev.source != "controller" {
-        return None;
+    // Node-scope events relevant to the inclusion UI. These come through
+    // with `node_id` set at the top level of the RawEvent and the source
+    // set to "node".
+    if let Some(node_id) = ev.node_id {
+        match ev.event.as_str() {
+            "interview started" => {
+                return Some(ControllerEvent::NodeInterviewStarted { node_id });
+            }
+            "node ready" => {
+                let raw = ev
+                    .node_state
+                    .clone()
+                    .unwrap_or_else(|| json!({ "nodeId": node_id }));
+                return Some(ControllerEvent::NodeReady { node_id, raw });
+            }
+            "interview failed" => {
+                let message = ev
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.get("errorMessage"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        ev.args
+                            .as_ref()
+                            .and_then(|a| a.get("message"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                return Some(ControllerEvent::NodeInterviewFailed { node_id, message });
+            }
+            _ => {}
+        }
     }
+
+    // Controller-scope events (inclusion lifecycle).
     let args = ev.args.as_ref();
     match ev.event.as_str() {
         "inclusion started" => Some(ControllerEvent::InclusionStarted),
@@ -206,6 +278,12 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
     let mut events = handle.subscribe();
     let ctx = Arc::new(ctx);
     let nodes_added: Arc<tokio::sync::Mutex<Vec<u32>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // Tracks nodes whose interview has completed during this inclusion
+    // session. Drives the end-of-include name/area prompt loop — only
+    // ready nodes can have set_name/set_location pushed back to zwave-js
+    // because the controller has finalized the device identity.
+    let nodes_ready: Arc<tokio::sync::Mutex<Vec<u32>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // Kick the controller into inclusion mode. Schema 24+ returns the
     // result in an object; older schemas return a bare boolean. We don't
@@ -239,7 +317,8 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
         tokio::select! {
             biased;
 
-            // User said "done" → stop inclusion, emit complete.
+            // User said "done" → stop inclusion, prompt for name/area on
+            // each ready node, then emit complete.
             _resp = &mut respond_fut => {
                 let _ = handle
                     .send_command(json!({
@@ -247,7 +326,93 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
                         "command": "controller.stop_inclusion",
                     }))
                     .await;
+
+                // Per-node configure prompt loop. Only nodes whose
+                // interview already finished are eligible — for the others,
+                // zwave-js still doesn't know the full device shape, so
+                // pushing a name/location now would race against the
+                // interview's own writes. They get default registration
+                // via the post-rescan + later `node ready` path.
+                let ready_ids = nodes_ready.lock().await.clone();
+                for node_id in &ready_ids {
+                    ctx.progress(
+                        None,
+                        Some("configuring"),
+                        Some(&format!("Configure node {node_id}")),
+                    )
+                    .await?;
+                    ctx.emit_awaiting_user_with_schema(
+                        format!(
+                            "Configure node {node_id} — set a name and area, or check Skip to leave defaults."
+                        ),
+                        json!({
+                            "name": {
+                                "type": "string",
+                                "description": "Display name in homeCore (also written to zwave-js)",
+                            },
+                            "area": {
+                                "type": "string",
+                                "description": "Area / location slug (also written to zwave-js as `location`)",
+                            },
+                            "skip": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Don't apply name/area; leave defaults",
+                            },
+                        }),
+                    )
+                    .await?;
+                    let resp = ctx.await_respond().await?;
+                    let skip = resp.get("skip").and_then(Value::as_bool).unwrap_or(false);
+                    if skip {
+                        continue;
+                    }
+                    let name = resp
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let area = resp
+                        .get("area")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+
+                    if let Some(n) = name {
+                        let _ = handle
+                            .send_command(json!({
+                                "messageId": format!("hc-name-{}", Uuid::new_v4()),
+                                "command": "node.set_name",
+                                "nodeId": node_id,
+                                "name": n,
+                            }))
+                            .await;
+                    }
+                    if let Some(a) = area {
+                        let _ = handle
+                            .send_command(json!({
+                                "messageId": format!("hc-loc-{}", Uuid::new_v4()),
+                                "command": "node.set_location",
+                                "nodeId": node_id,
+                                "location": a,
+                            }))
+                            .await;
+                    }
+                    let mut item = json!({ "node_id": node_id, "status": "configured" });
+                    if let (Some(obj), Some(n)) = (item.as_object_mut(), name) {
+                        obj.insert("name".into(), json!(n));
+                    }
+                    if let (Some(obj), Some(a)) = (item.as_object_mut(), area) {
+                        obj.insert("area".into(), json!(a));
+                    }
+                    ctx.item_update(item).await?;
+                }
+
                 let ids = nodes_added.lock().await.clone();
+                // Rescan now picks up the new names/locations — publish_node
+                // reads node.location and passes it as the area to
+                // register_device_full so homeCore reflects the choice.
+                handle.request_rescan();
                 return ctx.complete(json!({ "nodes_added": ids })).await;
             }
 
@@ -270,9 +435,15 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
                     }
                     Ok(ControllerEvent::NodeAdded { node_id, raw }) => {
                         nodes_added.lock().await.push(node_id);
+                        ctx.progress(
+                            None,
+                            Some("included"),
+                            Some(&format!("Node {node_id} included; interviewing…")),
+                        )
+                        .await?;
                         let mut item = json!({
                             "node_id": node_id,
-                            "status": "interviewing",
+                            "status": "added",
                         });
                         if let Some(obj) = item.as_object_mut() {
                             for key in ["manufacturer", "label", "productType", "productId"] {
@@ -282,6 +453,67 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
                             }
                         }
                         ctx.item_add(item).await?;
+                    }
+                    Ok(ControllerEvent::NodeInterviewStarted { node_id }) => {
+                        ctx.progress(
+                            None,
+                            Some("interviewing"),
+                            Some(&format!("Interviewing node {node_id}")),
+                        )
+                        .await?;
+                        ctx.item_update(json!({
+                            "node_id": node_id,
+                            "status": "interviewing",
+                        }))
+                        .await?;
+                    }
+                    Ok(ControllerEvent::NodeReady { node_id, raw }) => {
+                        nodes_ready.lock().await.push(node_id);
+                        let mut item = json!({
+                            "node_id": node_id,
+                            "status": "ready",
+                        });
+                        if let Some(obj) = item.as_object_mut() {
+                            // Carry forward whatever zwave-js gave us in the
+                            // nodeState payload — manufacturer/label/firmware
+                            // are typically present once the interview lands.
+                            for key in [
+                                "manufacturer",
+                                "label",
+                                "productType",
+                                "productId",
+                                "firmwareVersion",
+                                "name",
+                            ] {
+                                if let Some(v) = raw.get(key) {
+                                    obj.insert(key.into(), v.clone());
+                                }
+                            }
+                        }
+                        ctx.item_update(item).await?;
+                        ctx.progress(
+                            None,
+                            Some("interviewed"),
+                            Some(&format!("Node {node_id} interview complete")),
+                        )
+                        .await?;
+                    }
+                    Ok(ControllerEvent::NodeInterviewFailed { node_id, message }) => {
+                        let mut item = json!({
+                            "node_id": node_id,
+                            "status": "failed",
+                        });
+                        if let (Some(obj), Some(msg)) = (item.as_object_mut(), message.as_ref()) {
+                            obj.insert("error".into(), json!(msg));
+                        }
+                        ctx.item_update(item).await?;
+                        ctx.warning(
+                            message.unwrap_or_else(|| {
+                                format!("Interview failed for node {node_id}")
+                            }),
+                            Some(json!({ "node_id": node_id })),
+                        )
+                        .await?;
                     }
                     Ok(ControllerEvent::InclusionFailed { message }) => {
                         return ctx
@@ -471,8 +703,68 @@ mod tests {
     }
 
     #[test]
-    fn ignores_node_scope_events() {
+    fn ignores_unrelated_node_scope_events() {
+        // Node-scope events the inclusion stream doesn't track stay None.
         let e = raw("node", "value updated", json!({}));
         assert!(decode_controller_event(&e).is_none());
+    }
+
+    fn raw_with_node_id(source: &str, event: &str, node_id: u32, extras: Value) -> RawEvent {
+        let mut v = json!({
+            "source": source,
+            "event": event,
+            "nodeId": node_id,
+        });
+        if let Some(o) = v.as_object_mut() {
+            if let Some(extras_obj) = extras.as_object() {
+                for (k, val) in extras_obj {
+                    o.insert(k.clone(), val.clone());
+                }
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn decodes_node_interview_started() {
+        let e = raw_with_node_id("node", "interview started", 14, json!({}));
+        match decode_controller_event(&e) {
+            Some(ControllerEvent::NodeInterviewStarted { node_id }) => assert_eq!(node_id, 14),
+            other => panic!("expected NodeInterviewStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_node_ready_carries_node_state() {
+        let e = raw_with_node_id(
+            "node",
+            "node ready",
+            14,
+            json!({ "nodeState": { "nodeId": 14, "manufacturer": "Aeotec" } }),
+        );
+        match decode_controller_event(&e) {
+            Some(ControllerEvent::NodeReady { node_id, raw }) => {
+                assert_eq!(node_id, 14);
+                assert_eq!(raw.get("manufacturer").and_then(|v| v.as_str()), Some("Aeotec"));
+            }
+            other => panic!("expected NodeReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_node_interview_failed_with_message() {
+        let e = raw_with_node_id(
+            "node",
+            "interview failed",
+            14,
+            json!({ "args": { "errorMessage": "Timeout" } }),
+        );
+        match decode_controller_event(&e) {
+            Some(ControllerEvent::NodeInterviewFailed { node_id, message }) => {
+                assert_eq!(node_id, 14);
+                assert_eq!(message.as_deref(), Some("Timeout"));
+            }
+            other => panic!("expected NodeInterviewFailed, got {other:?}"),
+        }
     }
 }

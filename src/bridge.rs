@@ -15,7 +15,7 @@
 
 use crate::config::Config;
 use crate::inclusion::{decode_controller_event, ControllerEvent};
-use crate::translator::{property_key_str, Translator};
+use crate::translator::{property_key_str, synthetic_attr_name, Translator};
 use crate::types::{NodeState, NodeValue, ResultMsg, ServerMsg, ValueUpdatedArgs};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -92,6 +92,13 @@ fn translate_node_value(
         translator.translate(v.command_class, v.endpoint, &v.property, pk, raw)
     {
         map.insert(attr, val);
+    } else {
+        // Generic fallback so every device value is visible even when the
+        // alias table doesn't know the canonical name. Identical naming
+        // logic in `handle_event` so the initial state and subsequent
+        // value-updated events agree on the attribute name.
+        let attr = synthetic_attr_name(v.command_class, v.endpoint, &v.property, pk);
+        map.insert(attr, raw.clone());
     }
 }
 
@@ -107,8 +114,13 @@ async fn publish_node(
         .filter(|n| !n.is_empty())
         .unwrap_or(&device_id)
         .to_string();
+    // Treat zwave-js's per-node `location` as the homeCore area. The
+    // include flow's name+area prompt writes both via `node.set_name` /
+    // `node.set_location` to zwave-js, then triggers a rescan that lands
+    // here.
+    let area = node.location.as_deref().filter(|s| !s.is_empty());
     publisher
-        .register_device_full(&device_id, &display_name, Some("zwave"), None, None)
+        .register_device_full(&device_id, &display_name, Some("zwave"), area, None)
         .await?;
 
     // Diagnostic: log all CC 98 (Door Lock) value IDs so we can see exactly what the
@@ -136,7 +148,18 @@ async fn publish_node(
     }
 
     let state = build_state(node, translator);
-    publisher.publish_state(&device_id, &state).await?;
+    // Partial-merge, NOT full replace. zwave-js's `start_listening` /
+    // `node ready` snapshots can be transiently sparse — particularly
+    // for a freshly-included node whose interview hasn't yet populated
+    // every CC's values, or after a brief reconnect during an active
+    // interview. A full replace wipes any attribute not in the current
+    // snapshot, so the device's homeCore record flickers back to
+    // "empty" and the auto-create path then loses device_type. Partial
+    // merge preserves prior attributes; missing values just don't get
+    // updated this round, and the next `value updated` event refreshes
+    // them. Trade-off: a CC removed in firmware would leave a stale
+    // attribute in homeCore until manually cleared. Acceptable.
+    publisher.publish_state_partial(&device_id, &state).await?;
     publisher
         .publish_availability(&device_id, node.is_available())
         .await?;
@@ -295,6 +318,9 @@ pub struct Bridge {
     /// handlers subscribe to. Cloned into the WS loop; long-lived so
     /// active subscribers survive reconnects.
     pub event_tx: broadcast::Sender<ControllerEvent>,
+    /// `rescan_nodes` management action pings this; the WS loop sends a
+    /// fresh `start_listening` and republishes every node from the result.
+    pub rescan_rx: mpsc::Receiver<()>,
 }
 
 impl Bridge {
@@ -373,6 +399,7 @@ impl Bridge {
                 &mut ws_rx,
                 &mut sv_rx,
                 &mut self.control_rx,
+                &mut self.rescan_rx,
                 &publisher,
                 &translator,
                 &event_tx,
@@ -391,18 +418,80 @@ async fn ws_event_loop(
     ws_rx: &mut WsStream,
     cmd_rx: &mut mpsc::Receiver<SetValueCmd>,
     control_rx: &mut mpsc::Receiver<Value>,
+    rescan_rx: &mut mpsc::Receiver<()>,
     publisher: &DevicePublisher,
     translator: &Translator,
     event_tx: &broadcast::Sender<ControllerEvent>,
 ) -> Result<()> {
+    // Tracks an in-flight `start_listening` issued by a rescan request.
+    // We refuse a second rescan while one is pending — `start_listening`
+    // re-snapshots the entire controller and re-running it concurrently
+    // is wasteful.
+    let mut pending_rescan_id: Option<String> = None;
+
     loop {
         tokio::select! {
             // Incoming WebSocket message
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_ws_message(&text, publisher, translator, event_tx).await {
-                            warn!(error = %e, "Error handling WS message");
+                        // Rescan completion takes precedence — if this is
+                        // the Result for our pending start_listening,
+                        // republish all nodes here instead of letting it
+                        // drop into handle_ws_message (which only logs
+                        // failures).
+                        let mut consumed = false;
+                        if let Some(expected) = pending_rescan_id.as_ref() {
+                            if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                                let is_result = val.get("type").and_then(Value::as_str)
+                                    == Some("result");
+                                let id_match = val.get("messageId").and_then(Value::as_str)
+                                    == Some(expected.as_str());
+                                if is_result && id_match {
+                                    let success = val.get("success")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    if success {
+                                        let nodes: Vec<NodeState> = val
+                                            .get("result")
+                                            .and_then(|r| r.get("state"))
+                                            .and_then(|s| s.get("nodes"))
+                                            .and_then(|n| n.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(NodeState::from_value)
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        info!(
+                                            count = nodes.len(),
+                                            "Rescan: republishing node states"
+                                        );
+                                        for node in &nodes {
+                                            if let Err(e) =
+                                                publish_node(publisher, node, translator).await
+                                            {
+                                                warn!(
+                                                    node_id = node.node_id,
+                                                    error = %e,
+                                                    "Rescan publish_node failed"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        warn!("Rescan start_listening returned success=false");
+                                    }
+                                    pending_rescan_id = None;
+                                    consumed = true;
+                                }
+                            }
+                        }
+                        if !consumed {
+                            if let Err(e) =
+                                handle_ws_message(&text, publisher, translator, event_tx).await
+                            {
+                                warn!(error = %e, "Error handling WS message");
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {}
@@ -438,6 +527,32 @@ async fn ws_event_loop(
                     }
                 }
             }
+            // Rescan ping from the management custom_handler.
+            sig = rescan_rx.recv() => {
+                match sig {
+                    Some(()) => {
+                        if pending_rescan_id.is_some() {
+                            debug!("Rescan already pending; ignoring duplicate request");
+                            continue;
+                        }
+                        let msg_id = format!("hc-zwave-rescan-{}", Uuid::new_v4());
+                        if let Err(e) = ws_send(
+                            ws_tx,
+                            &json!({ "messageId": &msg_id, "command": "start_listening" }),
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "Rescan: failed to send start_listening");
+                        } else {
+                            info!(message_id = %msg_id, "Rescan: start_listening sent");
+                            pending_rescan_id = Some(msg_id);
+                        }
+                    }
+                    None => {
+                        // Sender dropped — keep the loop running.
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -463,6 +578,28 @@ async fn handle_ws_message(
             // (include_node / exclude_node). Node-scope events keep
             // flowing through the existing handle_event pipeline.
             if let Some(ctrl_ev) = decode_controller_event(&wrapper.event) {
+                // Exclusion is unambiguous — the device is gone, so we
+                // unregister immediately. (handle_event's "node removed"
+                // arm requires a top-level `nodeId`, which the
+                // controller-scope event may omit, so we cover that gap
+                // here.) Inclusion is NOT handled here on purpose:
+                // zwave-js can't tell us what the device is until its
+                // interview completes — registering on NodeAdded would
+                // produce a placeholder with no command classes and no
+                // schema. We instead rely on the node-scope `node ready`
+                // path in handle_event, plus the explicit `rescan_nodes`
+                // manifest action for users who don't want to wait.
+                if let ControllerEvent::NodeRemoved { node_id } = &ctrl_ev {
+                    let device_id = node_device_id(*node_id);
+                    let plugin_id = publisher.plugin_id().to_string();
+                    if let Err(e) =
+                        publisher.unregister_device(&plugin_id, &device_id).await
+                    {
+                        warn!(node_id, error = %e, "unregister_device on NodeRemoved failed");
+                    } else {
+                        info!(node_id, device_id, "Unregistered node on exclusion");
+                    }
+                }
                 // Ignore send failures — broadcast returns an error only
                 // when there are no subscribers, which is the normal
                 // case between inclusion sessions.
@@ -500,30 +637,49 @@ async fn handle_event(
                 if let Ok(args) = serde_json::from_value::<ValueUpdatedArgs>(args_val) {
                     let pk_str = args.property_key.as_ref().and_then(property_key_str);
                     let pk = pk_str.as_deref();
-                    if let Some((attr, val)) = translator.translate(
+                    let (attr, val) = match translator.translate(
                         args.command_class,
                         args.endpoint,
                         &args.property,
                         pk,
                         &args.new_value,
                     ) {
-                        debug!(node_id, %attr, value = ?val, "Value translated → publishing");
-                        let patch = json!({ attr: val });
-                        publisher.publish_state_partial(&device_id, &patch).await?;
-                    } else {
-                        // Log unmatched sensor CCs at debug so mismatches are diagnosable.
-                        let cc = args.command_class;
-                        if cc == 48 || cc == 113 {
+                        Some((a, v)) => (a, v),
+                        None => {
+                            // Generic fallback — synthesise a stable attribute
+                            // name so unaliased values still land in homeCore.
+                            let attr = synthetic_attr_name(
+                                args.command_class,
+                                args.endpoint,
+                                &args.property,
+                                pk,
+                            );
                             debug!(
                                 node_id,
-                                cc,
+                                cc = args.command_class,
                                 prop = %args.property,
                                 prop_key = ?pk,
+                                synth_attr = %attr,
                                 value = ?args.new_value,
-                                "Unmatched sensor value — no alias table entry"
+                                "Unaliased value — publishing under synthetic name"
                             );
+                            (attr, args.new_value.clone())
                         }
+                    };
+                    // Skip null values — partial-merge semantics treat
+                    // null as "delete this attribute" on the homeCore
+                    // side, which would silently wipe whatever was there
+                    // (state_bridge::apply_partial_merge_patch). zwave-js
+                    // can fire `value updated` with a null `newValue` for
+                    // values that go idle or briefly drop out; we don't
+                    // want those to clear data.
+                    if val.is_null() {
+                        debug!(node_id, %attr, "Null value — skipping partial publish");
+                        return Ok(());
                     }
+                    debug!(node_id, %attr, value = ?val, "Value → publishing");
+                    let patch = json!({ attr: val });
+                    publisher.publish_state_partial(&device_id, &patch).await?;
                 }
             }
         }

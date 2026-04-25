@@ -124,10 +124,17 @@ async fn try_start(
     let publisher = client.device_publisher();
     let (cmd_tx, cmd_rx) = mpsc::channel::<(String, serde_json::Value)>(256);
 
+    // Rescan signal — `rescan_nodes` management action pushes onto this
+    // channel; the bridge's WS loop sends `start_listening` to zwave-js
+    // and republishes all node states from the result. The InclusionHandle
+    // also gets a clone so include_node can self-trigger a rescan once
+    // the user marks inclusion done.
+    let (rescan_tx, rescan_rx) = mpsc::channel::<()>(8);
+
     // Inclusion / exclusion streaming channels. The handle is cloned
     // into every streaming action closure; the bridge drains the raw
     // control channel and publishes decoded controller events.
-    let (inclusion_handle, control_rx, event_tx) = inclusion::new_handle();
+    let (inclusion_handle, control_rx, event_tx) = inclusion::new_handle(rescan_tx.clone());
 
     // Enable management protocol (heartbeat + remote config/log commands,
     // plus streaming include_node + exclude_node actions).
@@ -139,7 +146,14 @@ async fn try_start(
             Some(log_level_handle),
         )
         .await?
-        .with_capabilities(capabilities_manifest());
+        .with_capabilities(capabilities_manifest())
+        .with_custom_handler(move |cmd| match cmd["action"].as_str()? {
+            "rescan_nodes" => {
+                let _ = rescan_tx.try_send(());
+                Some(serde_json::json!({ "status": "ok" }))
+            }
+            _ => None,
+        });
     let mgmt = inclusion::register_actions(mgmt, inclusion_handle);
 
     // Start the SDK event loop FIRST so the MQTT eventloop is pumping while
@@ -180,6 +194,7 @@ async fn try_start(
         cmd_rx,
         control_rx,
         event_tx,
+        rescan_rx,
     }
     .run()
     .await
@@ -235,6 +250,27 @@ fn capabilities_manifest() -> hc_types::Capabilities {
                 item_operations: Some(vec![ItemOp::Remove]),
                 requires_role: RequiresRole::Admin,
                 timeout_ms: Some(300_000),
+            },
+            Action {
+                id: "rescan_nodes".into(),
+                label: "Rescan nodes".into(),
+                description: Some(
+                    "Re-fetch every node's full state from zwave-js and \
+                     republish to homeCore. Use this after inclusion if a \
+                     freshly-added device hasn't appeared yet — typically \
+                     because its interview is still running. Safe to invoke \
+                     any time; non-destructive."
+                        .into(),
+                ),
+                params: None,
+                result: None,
+                stream: false,
+                cancelable: false,
+                concurrency: Concurrency::default(),
+                item_key: None,
+                item_operations: None,
+                requires_role: RequiresRole::User,
+                timeout_ms: None,
             },
         ],
     }
