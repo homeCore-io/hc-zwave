@@ -21,29 +21,11 @@ use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use plugin_sdk_rs::DevicePublisher;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-// ---------------------------------------------------------------------------
-// Published-IDs cache
-// ---------------------------------------------------------------------------
-
-fn load_published_ids(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-        .unwrap_or_default()
-}
-
-fn save_published_ids(path: &Path, device_ids: &[String]) -> Result<()> {
-    let payload = serde_json::to_vec_pretty(device_ids)?;
-    std::fs::write(path, payload)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Node state → MQTT
@@ -306,7 +288,6 @@ struct SetValueCmd {
 
 pub struct Bridge {
     pub config: Config,
-    pub published_ids_cache_path: PathBuf,
     pub publisher: DevicePublisher,
     pub cmd_rx: mpsc::Receiver<(String, Value)>,
     /// Raw zwave-js-server commands pushed by streaming action handlers
@@ -354,26 +335,18 @@ impl Bridge {
         // --- Handshake ---
         let translator = Translator::new();
         let nodes = handshake(&mut ws_tx, &mut ws_rx, cfg.server.schema_version).await?;
-        let current_ids: Vec<String> = nodes
+        let current_ids: std::collections::HashSet<String> = nodes
             .iter()
             .map(|node| node_device_id(node.node_id))
             .collect();
 
-        // --- Unregister stale devices ---
-        let plugin_id = self.publisher.plugin_id().to_string();
-        for stale_id in load_published_ids(&self.published_ids_cache_path)
-            .into_iter()
-            .filter(|device_id| !current_ids.iter().any(|current| current == device_id))
-        {
-            if let Err(e) = self
-                .publisher
-                .unregister_device(&plugin_id, &stale_id)
-                .await
-            {
-                warn!(device_id = %stale_id, error = %e, "Failed to unregister stale Z-Wave device");
-            } else {
-                info!(device_id = %stale_id, "Unregistered stale Z-Wave device");
-            }
+        // --- Unregister stale devices via SDK reconcile ---
+        // SDK has the persisted set from prior sessions plus anything
+        // we've registered this session; diff gives us stale devices
+        // (nodes excluded from the controller while this plugin was
+        // offline) which it unregisters and prunes from the snapshot.
+        if let Err(e) = self.publisher.reconcile_devices(current_ids.clone()).await {
+            warn!(error = %e, "reconcile_devices failed");
         }
 
         // --- Publish initial state + subscribe to commands ---
@@ -382,7 +355,6 @@ impl Bridge {
                 warn!(node_id = node.node_id, error = %e, "Failed to publish initial node state");
             }
         }
-        save_published_ids(&self.published_ids_cache_path, &current_ids)?;
 
         // --- Command channel: SDK cmd_rx → WS sender ---
         let (sv_tx, mut sv_rx) = mpsc::channel::<SetValueCmd>(64);
