@@ -39,7 +39,7 @@ impl Transform {
             Transform::NonzeroBool => {
                 let nonzero = match v {
                     Value::Bool(b) => *b,
-                    Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+                    Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
                     _ => false,
                 };
                 Value::Bool(nonzero)

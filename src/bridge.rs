@@ -366,16 +366,16 @@ impl Bridge {
         let publisher = self.publisher.clone();
         let event_tx = self.event_tx.clone();
         tokio::select! {
-            res = ws_event_loop(
-                &mut ws_tx,
-                &mut ws_rx,
-                &mut sv_rx,
-                &mut self.control_rx,
-                &mut self.rescan_rx,
-                &publisher,
-                &translator,
-                &event_tx,
-            ) => res,
+            res = ws_event_loop(WsLoopDeps {
+                ws_tx: &mut ws_tx,
+                ws_rx: &mut ws_rx,
+                cmd_rx: &mut sv_rx,
+                control_rx: &mut self.control_rx,
+                rescan_rx: &mut self.rescan_rx,
+                publisher: &publisher,
+                translator: &translator,
+                event_tx: &event_tx,
+            }) => res,
             res = cmd_dispatch_loop(&mut self.cmd_rx, &sv_tx, &cmd_translator) => res,
         }
     }
@@ -385,16 +385,31 @@ impl Bridge {
 // WS event loop
 // ---------------------------------------------------------------------------
 
-async fn ws_event_loop(
-    ws_tx: &mut WsSink,
-    ws_rx: &mut WsStream,
-    cmd_rx: &mut mpsc::Receiver<SetValueCmd>,
-    control_rx: &mut mpsc::Receiver<Value>,
-    rescan_rx: &mut mpsc::Receiver<()>,
-    publisher: &DevicePublisher,
-    translator: &Translator,
-    event_tx: &broadcast::Sender<ControllerEvent>,
-) -> Result<()> {
+/// Bundles the WS connection + channels + helpers that `ws_event_loop`
+/// needs. Grouping keeps the function below clippy's `too_many_arguments`
+/// threshold without splitting the loop itself.
+struct WsLoopDeps<'a> {
+    ws_tx: &'a mut WsSink,
+    ws_rx: &'a mut WsStream,
+    cmd_rx: &'a mut mpsc::Receiver<SetValueCmd>,
+    control_rx: &'a mut mpsc::Receiver<Value>,
+    rescan_rx: &'a mut mpsc::Receiver<()>,
+    publisher: &'a DevicePublisher,
+    translator: &'a Translator,
+    event_tx: &'a broadcast::Sender<ControllerEvent>,
+}
+
+async fn ws_event_loop(deps: WsLoopDeps<'_>) -> Result<()> {
+    let WsLoopDeps {
+        ws_tx,
+        ws_rx,
+        cmd_rx,
+        control_rx,
+        rescan_rx,
+        publisher,
+        translator,
+        event_tx,
+    } = deps;
     // Tracks an in-flight `start_listening` issued by a rescan request.
     // We refuse a second rescan while one is pending — `start_listening`
     // re-snapshots the entire controller and re-running it concurrently
