@@ -1,5 +1,7 @@
 # hc-zwave
 
+[![CI](https://github.com/homeCore-io/hc-zwave/actions/workflows/ci.yml/badge.svg)](https://github.com/homeCore-io/hc-zwave/actions/workflows/ci.yml) [![Release](https://github.com/homeCore-io/hc-zwave/actions/workflows/release.yml/badge.svg)](https://github.com/homeCore-io/hc-zwave/actions/workflows/release.yml) [![Dashboard](https://img.shields.io/badge/builds-dashboard-blue?style=flat-square)](https://homecore.io/lf-workflow-dash/)
+
 Bridges Z-Wave devices into HomeCore via the zwave-js-server WebSocket API.
 
 Works with [ZwaveJS UI](https://zwave-js.github.io/zwave-js-ui/) or a standalone zwave-js-server instance.
