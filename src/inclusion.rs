@@ -33,25 +33,39 @@ use uuid::Uuid;
 pub enum ControllerEvent {
     InclusionStarted,
     InclusionStopped,
-    InclusionFailed { message: Option<String> },
+    InclusionFailed {
+        message: Option<String>,
+    },
     ExclusionStarted,
     ExclusionStopped,
-    ExclusionFailed { message: Option<String> },
+    ExclusionFailed {
+        message: Option<String>,
+    },
     /// A node was added to the network. `raw` carries whatever zwave-js
     /// sends in the `node` payload (id, manufacturer, device type, etc.)
     /// so the UI can surface richer metadata. Usually followed by a
     /// pair of `interview started` / `node ready` events as the device
     /// completes its interview.
-    NodeAdded { node_id: u32, raw: Value },
-    NodeRemoved { node_id: u32 },
+    NodeAdded {
+        node_id: u32,
+        raw: Value,
+    },
+    NodeRemoved {
+        node_id: u32,
+    },
     /// zwave-js has begun interviewing a freshly-added node. Used to flip
     /// the inclusion item from `interviewing` (its initial post-add state)
     /// to a more informative label.
-    NodeInterviewStarted { node_id: u32 },
+    NodeInterviewStarted {
+        node_id: u32,
+    },
     /// Interview finished — node is fully ready. `raw` is the `nodeState`
     /// payload zwave-js attaches to `node ready`, suitable for upserting
     /// into the inclusion item with richer fields (firmware, name, etc.).
-    NodeReady { node_id: u32, raw: Value },
+    NodeReady {
+        node_id: u32,
+        raw: Value,
+    },
     /// Interview failed; the node may still be partially usable but the
     /// inclusion UI should mark the item as failed rather than stuck on
     /// "interviewing" forever.
@@ -61,7 +75,10 @@ pub enum ControllerEvent {
     },
     /// S2 bootstrap asking the client which security classes to grant.
     /// Plugin auto-accepts all requested classes in v1.
-    GrantSecurityClasses { request_id: String, requested: Value },
+    GrantSecurityClasses {
+        request_id: String,
+        requested: Value,
+    },
     /// S2 bootstrap asking for DSK PIN entry. Plugin cannot prompt for
     /// this in v1 — logs a warning and lets zwave-js time out.
     /// `request_id` kept for when PIN entry lands in v2.
@@ -210,8 +227,7 @@ pub fn decode_controller_event(ev: &crate::types::RawEvent) -> Option<Controller
             let node_id = args
                 .and_then(|a| a.get("node"))
                 .and_then(|n| n.get("nodeId"))
-                .and_then(|n| n.as_u64())?
-                as u32;
+                .and_then(|n| n.as_u64())? as u32;
             Some(ControllerEvent::NodeRemoved { node_id })
         }
         "grant security classes" => {
@@ -255,20 +271,14 @@ pub fn decode_controller_event(ev: &crate::types::RawEvent) -> Option<Controller
 pub fn register_actions(mgmt: ManagementHandle, handle: InclusionHandle) -> ManagementHandle {
     let include_handle = handle.clone();
     let exclude_handle = handle;
-    mgmt.with_streaming_action(StreamingAction::new(
-        "include_node",
-        move |ctx, params| {
-            let h = include_handle.clone();
-            async move { include_node(ctx, params, h).await }
-        },
-    ))
-    .with_streaming_action(StreamingAction::new(
-        "exclude_node",
-        move |ctx, params| {
-            let h = exclude_handle.clone();
-            async move { exclude_node(ctx, params, h).await }
-        },
-    ))
+    mgmt.with_streaming_action(StreamingAction::new("include_node", move |ctx, params| {
+        let h = include_handle.clone();
+        async move { include_node(ctx, params, h).await }
+    }))
+    .with_streaming_action(StreamingAction::new("exclude_node", move |ctx, params| {
+        let h = exclude_handle.clone();
+        async move { exclude_node(ctx, params, h).await }
+    }))
 }
 
 /// Streaming handler: put the controller into inclusion mode and
@@ -277,7 +287,8 @@ pub fn register_actions(mgmt: ManagementHandle, handle: InclusionHandle) -> Mana
 async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandle) -> Result<()> {
     let mut events = handle.subscribe();
     let ctx = Arc::new(ctx);
-    let nodes_added: Arc<tokio::sync::Mutex<Vec<u32>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let nodes_added: Arc<tokio::sync::Mutex<Vec<u32>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Tracks nodes whose interview has completed during this inclusion
     // session. Drives the end-of-include name/area prompt loop — only
     // ready nodes can have set_name/set_location pushed back to zwave-js
@@ -296,7 +307,8 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
         }))
         .await?;
 
-    ctx.progress(Some(0), Some("waiting for controller"), None).await?;
+    ctx.progress(Some(0), Some("waiting for controller"), None)
+        .await?;
 
     // Advisory prompt — UI shows "Press include on device, click Done
     // when finished". `emit_awaiting_user_with_schema` is the emit-only
@@ -586,7 +598,8 @@ async fn include_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
 async fn exclude_node(ctx: StreamContext, _params: Value, handle: InclusionHandle) -> Result<()> {
     let mut events = handle.subscribe();
     let ctx = Arc::new(ctx);
-    let nodes_removed: Arc<tokio::sync::Mutex<Vec<u32>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let nodes_removed: Arc<tokio::sync::Mutex<Vec<u32>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     handle
         .send_command(json!({
@@ -595,7 +608,8 @@ async fn exclude_node(ctx: StreamContext, _params: Value, handle: InclusionHandl
         }))
         .await?;
 
-    ctx.progress(Some(0), Some("waiting for controller"), None).await?;
+    ctx.progress(Some(0), Some("waiting for controller"), None)
+        .await?;
 
     ctx.emit_awaiting_user_with_schema(
         "Press the exclude/reset button on each device. Reply when finished.",
@@ -695,7 +709,11 @@ mod tests {
 
     #[test]
     fn decodes_node_added_from_nested_node() {
-        let e = raw("controller", "node added", json!({ "node": { "nodeId": 12 } }));
+        let e = raw(
+            "controller",
+            "node added",
+            json!({ "node": { "nodeId": 12 } }),
+        );
         match decode_controller_event(&e) {
             Some(ControllerEvent::NodeAdded { node_id, .. }) => assert_eq!(node_id, 12),
             other => panic!("expected NodeAdded, got {other:?}"),
@@ -745,7 +763,10 @@ mod tests {
         match decode_controller_event(&e) {
             Some(ControllerEvent::NodeReady { node_id, raw }) => {
                 assert_eq!(node_id, 14);
-                assert_eq!(raw.get("manufacturer").and_then(|v| v.as_str()), Some("Aeotec"));
+                assert_eq!(
+                    raw.get("manufacturer").and_then(|v| v.as_str()),
+                    Some("Aeotec")
+                );
             }
             other => panic!("expected NodeReady, got {other:?}"),
         }

@@ -564,9 +564,7 @@ async fn handle_ws_message(
                 if let ControllerEvent::NodeRemoved { node_id } = &ctrl_ev {
                     let device_id = node_device_id(*node_id);
                     let plugin_id = publisher.plugin_id().to_string();
-                    if let Err(e) =
-                        publisher.unregister_device(&plugin_id, &device_id).await
-                    {
+                    if let Err(e) = publisher.unregister_device(&plugin_id, &device_id).await {
                         warn!(node_id, error = %e, "unregister_device on NodeRemoved failed");
                     } else {
                         info!(node_id, device_id, "Unregistered node on exclusion");
