@@ -28,5 +28,3 @@ flate2             = "1"
 chrono             = "0.4"
 toml               = "0.8"
 uuid               = { version = "1", features = ["v4"] }
-
-# Size-optimized release profile (matches homeCore-io/homeCore).
