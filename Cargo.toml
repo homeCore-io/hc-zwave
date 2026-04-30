@@ -30,7 +30,3 @@ toml               = "0.8"
 uuid               = { version = "1", features = ["v4"] }
 
 # Size-optimized release profile (matches homeCore-io/homeCore).
-[profile.release]
-strip         = "symbols"
-lto           = "thin"
-codegen-units = 1
