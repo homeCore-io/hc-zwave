@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name        = "hc-zwave"
 version     = "0.1.0"
