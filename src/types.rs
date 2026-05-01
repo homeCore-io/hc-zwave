@@ -112,6 +112,16 @@ pub struct NodeState {
     pub location: Option<String>,
     /// 1=Asleep, 2=Awake, 3=Dead, 4=Alive, 5=Unknown
     pub status: Option<u8>,
+    /// Mains-powered (always-listening) flag from zwave-js. False for any
+    /// battery device (sleeping or FLiRS).
+    #[serde(rename = "isListening", default)]
+    pub is_listening: Option<bool>,
+    /// FLiRS (Frequently Listening Routing Slave) — battery-powered but
+    /// wakes ~250ms/1000ms to accept commands. Door locks are typical.
+    /// zwave-js encodes this as `false | "1000ms" | "250ms"`, so accept
+    /// the raw JSON and treat any non-false/non-null value as FLiRS.
+    #[serde(rename = "isFrequentListening", default)]
+    pub is_frequent_listening: Option<Value>,
     /// Values may be absent on freshly-included nodes or those still interviewing.
     #[serde(default)]
     pub values: Vec<NodeValue>,

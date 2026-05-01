@@ -23,6 +23,7 @@ use plugin_sdk_rs::DevicePublisher;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -273,6 +274,156 @@ async fn handshake(
 }
 
 // ---------------------------------------------------------------------------
+// Startup value refresh
+// ---------------------------------------------------------------------------
+
+/// Whether to ask zwave-js to refresh primary-state values for this node on
+/// startup. We poll mains-powered nodes (`isListening=true`) and FLiRS nodes
+/// (`isFrequentListening` set to a wake-interval string — door locks are
+/// typical). Sleeping battery devices are skipped: they can't answer until
+/// they wake on their own schedule, and zwave-js will queue the request and
+/// flood the air when wake-up arrives.
+fn should_poll_initial_values(node: &NodeState) -> bool {
+    if node.is_listening.unwrap_or(false) {
+        return true;
+    }
+    matches!(
+        node.is_frequent_listening.as_ref(),
+        Some(v) if !v.is_null() && !matches!(v, Value::Bool(false))
+    )
+}
+
+/// Primary-state value IDs we ask zwave-js to refresh on startup. zwave-js
+/// caches each value's last seen state, but devices that only emit meter or
+/// sensor reports — and actuators that don't auto-report on local actuation —
+/// can leave their primary state (on / level / setpoint / mode / locked /
+/// barrier-state / color) stale across plugin restarts. Our snapshot then
+/// publishes those stale values over the live state in homeCore. Polling
+/// triggers a real Get to the device; the reply arrives as a `value updated`
+/// event and corrects everything downstream.
+///
+/// Endpoint is intentionally not constrained — multi-endpoint devices
+/// (e.g., a dual-relay smart plug exposing endpoints 1 and 2) need every
+/// endpoint refreshed.
+fn primary_state_values_to_poll(node: &NodeState) -> Vec<(u32, u32, String)> {
+    // (commandClass, property) pairs whose primary state we refresh. Add
+    // new actuator command classes here as they appear on the network.
+    const TARGETS: &[(u32, &str)] = &[
+        (37, "currentValue"),    // Binary Switch — on/off
+        (38, "currentValue"),    // Multilevel Switch — level (dimmer / shade / fan)
+        (64, "mode"),            // Thermostat Mode
+        (66, "state"),           // Thermostat Operating State
+        (67, "setpoint"),        // Thermostat Setpoint (per-type via propertyKey)
+        (68, "mode"),            // Thermostat Fan Mode
+        (98, "currentMode"),     // Door Lock
+        (102, "currentState"),   // Barrier Operator
+        (117, "currentColor"),   // Color Switch
+    ];
+    let mut out = Vec::new();
+    for v in &node.values {
+        for (cc, prop) in TARGETS {
+            if v.command_class == *cc && v.property == *prop {
+                out.push((*cc, v.endpoint, (*prop).to_string()));
+                break;
+            }
+        }
+    }
+    out
+}
+
+async fn send_poll_value(
+    ws_tx: &mut WsSink,
+    node_id: u32,
+    cc: u32,
+    endpoint: u32,
+    property: &str,
+) -> Result<()> {
+    let msg_id = format!("hc-poll-{}", Uuid::new_v4());
+    let msg = json!({
+        "messageId": msg_id,
+        "command": "node.poll_value",
+        "nodeId": node_id,
+        "valueId": {
+            "commandClass": cc,
+            "endpoint": endpoint,
+            "property": property,
+        },
+    });
+    ws_send(ws_tx, &msg).await
+}
+
+/// Inter-poll throttle. Each `node.poll_value` triggers a Get → device →
+/// response round-trip on the Z-Wave radio; firing dozens back-to-back
+/// causes routing congestion on the controller and starves real traffic.
+/// 200ms is comfortable for a 700-series controller — ~5 polls/sec, so a
+/// 100-poll startup completes in ~20s of background chatter.
+const POLL_DELAY: Duration = Duration::from_millis(200);
+
+/// Outcome of the planning step in [`refresh_primary_state`]. Splitting the
+/// pure categorization off from the async send loop keeps the counter logic
+/// directly testable without WS plumbing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PollPlan {
+    /// Per-node targets to poll, in the order encountered.
+    /// `(node_id, [(commandClass, endpoint, property), ...])`
+    polls: Vec<(u32, Vec<(u32, u32, String)>)>,
+    /// Sleeping battery devices we won't bother — zwave-js would just queue
+    /// the request and flood the air at wake-up.
+    skipped_battery: usize,
+    /// Mains/FLiRS nodes that expose no command class we currently refresh
+    /// (controller, repeater, sensor-only device). Tracked separately so
+    /// coverage gaps are visible in the log.
+    eligible_no_targets: usize,
+}
+
+/// Pure categorization step: walks the node list, decides which to poll, and
+/// records the bookkeeping counters. Side-effect free.
+fn plan_primary_state_refresh(nodes: &[NodeState]) -> PollPlan {
+    let mut plan = PollPlan::default();
+    for node in nodes {
+        if !should_poll_initial_values(node) {
+            plan.skipped_battery += 1;
+            continue;
+        }
+        let targets = primary_state_values_to_poll(node);
+        if targets.is_empty() {
+            plan.eligible_no_targets += 1;
+            continue;
+        }
+        plan.polls.push((node.node_id, targets));
+    }
+    plan
+}
+
+/// Best-effort refresh of primary-state values across all polled nodes.
+/// Failures log a warning and continue — a single unreachable node should
+/// not block startup.
+async fn refresh_primary_state(ws_tx: &mut WsSink, nodes: &[NodeState]) {
+    let plan = plan_primary_state_refresh(nodes);
+    let mut polled_values = 0usize;
+    for (node_id, targets) in &plan.polls {
+        for (cc, ep, prop) in targets {
+            polled_values += 1;
+            if let Err(e) = send_poll_value(ws_tx, *node_id, *cc, *ep, prop).await {
+                warn!(
+                    node_id = *node_id,
+                    cc, prop = %prop, error = %e,
+                    "Failed to send node.poll_value"
+                );
+            }
+            sleep(POLL_DELAY).await;
+        }
+    }
+    info!(
+        polled_nodes = plan.polls.len(),
+        polled_values,
+        skipped_battery = plan.skipped_battery,
+        eligible_no_targets = plan.eligible_no_targets,
+        "Refreshed primary-state values"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main bridge loop
 // ---------------------------------------------------------------------------
 
@@ -355,6 +506,16 @@ impl Bridge {
                 warn!(node_id = node.node_id, error = %e, "Failed to publish initial node state");
             }
         }
+
+        // --- Refresh primary-state values ---
+        // zwave-js's per-node cache holds whatever value the device last
+        // reported; for switches/plugs that only emit meter reports and
+        // dimmers/locks that don't auto-report on local actuation, that
+        // cache can drift from reality and the snapshot above will then
+        // publish a stale `on`/`brightness`/`locked`. Poll the primary
+        // value for each non-sleeping node so a fresh Get is issued; the
+        // reply arrives as a `value updated` event and corrects state.
+        refresh_primary_state(&mut ws_tx, &nodes).await;
 
         // --- Command channel: SDK cmd_rx → WS sender ---
         let (sv_tx, mut sv_rx) = mpsc::channel::<SetValueCmd>(64);
@@ -465,6 +626,7 @@ async fn ws_event_loop(deps: WsLoopDeps<'_>) -> Result<()> {
                                                 );
                                             }
                                         }
+                                        refresh_primary_state(ws_tx, &nodes).await;
                                     } else {
                                         warn!("Rescan start_listening returned success=false");
                                     }
@@ -851,5 +1013,277 @@ async fn handle_cmd(
             attributes = ?unrecognised,
             "Some command attributes had no write target (others dispatched)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — startup primary-state value refresh
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(j: serde_json::Value) -> NodeState {
+        serde_json::from_value(j).expect("test fixture must parse")
+    }
+
+    fn val(cc: u32, ep: u32, prop: &str) -> serde_json::Value {
+        json!({ "commandClass": cc, "endpoint": ep, "property": prop })
+    }
+
+    fn node_with_values(node_id: u32, values: Vec<serde_json::Value>) -> NodeState {
+        node(json!({
+            "nodeId": node_id,
+            "isListening": true,
+            "values": values,
+        }))
+    }
+
+    // ---- should_poll_initial_values --------------------------------------
+
+    #[test]
+    fn poll_eligible_when_mains_powered() {
+        let n = node(json!({ "nodeId": 1, "isListening": true }));
+        assert!(should_poll_initial_values(&n));
+    }
+
+    #[test]
+    fn poll_eligible_when_flirs_250ms() {
+        let n = node(json!({
+            "nodeId": 1, "isListening": false, "isFrequentListening": "250ms"
+        }));
+        assert!(should_poll_initial_values(&n));
+    }
+
+    #[test]
+    fn poll_eligible_when_flirs_1000ms() {
+        let n = node(json!({
+            "nodeId": 1, "isListening": false, "isFrequentListening": "1000ms"
+        }));
+        assert!(should_poll_initial_values(&n));
+    }
+
+    #[test]
+    fn poll_skipped_when_sleeping_battery() {
+        let n = node(json!({
+            "nodeId": 1, "isListening": false, "isFrequentListening": false
+        }));
+        assert!(!should_poll_initial_values(&n));
+    }
+
+    #[test]
+    fn poll_skipped_when_flirs_field_null() {
+        let n = node(json!({
+            "nodeId": 1, "isListening": false, "isFrequentListening": null
+        }));
+        assert!(!should_poll_initial_values(&n));
+    }
+
+    #[test]
+    fn poll_skipped_when_both_fields_missing() {
+        // Be conservative when zwave-js omits the metadata.
+        let n = node(json!({ "nodeId": 1 }));
+        assert!(!should_poll_initial_values(&n));
+    }
+
+    // ---- primary_state_values_to_poll: each TARGET command class ---------
+
+    #[test]
+    fn matches_binary_switch() {
+        let n = node_with_values(1, vec![val(37, 0, "currentValue")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(37, 0, "currentValue".into())]
+        );
+    }
+
+    #[test]
+    fn matches_multilevel_switch() {
+        let n = node_with_values(1, vec![val(38, 0, "currentValue")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(38, 0, "currentValue".into())]
+        );
+    }
+
+    #[test]
+    fn matches_thermostat_mode() {
+        let n = node_with_values(1, vec![val(64, 0, "mode")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(64, 0, "mode".into())]
+        );
+    }
+
+    #[test]
+    fn matches_thermostat_operating_state() {
+        let n = node_with_values(1, vec![val(66, 0, "state")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(66, 0, "state".into())]
+        );
+    }
+
+    #[test]
+    fn matches_thermostat_setpoint() {
+        let n = node_with_values(1, vec![val(67, 0, "setpoint")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(67, 0, "setpoint".into())]
+        );
+    }
+
+    #[test]
+    fn matches_thermostat_fan_mode() {
+        let n = node_with_values(1, vec![val(68, 0, "mode")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(68, 0, "mode".into())]
+        );
+    }
+
+    #[test]
+    fn matches_door_lock() {
+        let n = node_with_values(1, vec![val(98, 0, "currentMode")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(98, 0, "currentMode".into())]
+        );
+    }
+
+    #[test]
+    fn matches_barrier_operator() {
+        let n = node_with_values(1, vec![val(102, 0, "currentState")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(102, 0, "currentState".into())]
+        );
+    }
+
+    #[test]
+    fn matches_color_switch() {
+        let n = node_with_values(1, vec![val(117, 0, "currentColor")]);
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![(117, 0, "currentColor".into())]
+        );
+    }
+
+    // ---- primary_state_values_to_poll: false-positive guards -------------
+
+    #[test]
+    fn ignores_target_value_property() {
+        // Target values are commands, not state; only currentValue is state.
+        let n = node_with_values(
+            1,
+            vec![val(37, 0, "targetValue"), val(38, 0, "duration")],
+        );
+        assert!(primary_state_values_to_poll(&n).is_empty());
+    }
+
+    #[test]
+    fn ignores_unrelated_command_class() {
+        // CC 50 (Meter) intentionally not in TARGETS — meter reports come
+        // unsolicited and don't drift like actuator state.
+        let n = node_with_values(1, vec![val(50, 0, "value")]);
+        assert!(primary_state_values_to_poll(&n).is_empty());
+    }
+
+    // ---- multi-endpoint coverage -----------------------------------------
+
+    #[test]
+    fn matches_every_endpoint_for_multi_endpoint_devices() {
+        // Dual-relay smart plug: same (cc, prop) on endpoints 1 and 2.
+        let n = node_with_values(
+            1,
+            vec![val(37, 1, "currentValue"), val(37, 2, "currentValue")],
+        );
+        assert_eq!(
+            primary_state_values_to_poll(&n),
+            vec![
+                (37, 1, "currentValue".into()),
+                (37, 2, "currentValue".into()),
+            ]
+        );
+    }
+
+    // ---- mixed value list -------------------------------------------------
+
+    #[test]
+    fn extracts_only_targets_from_mixed_value_list() {
+        let n = node_with_values(
+            1,
+            vec![
+                val(37, 0, "currentValue"), // match
+                val(37, 0, "targetValue"),  // ignore
+                val(50, 0, "value"),        // ignore (Meter)
+                val(98, 0, "currentMode"),  // match
+            ],
+        );
+        let got = primary_state_values_to_poll(&n);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&(37, 0, "currentValue".into())));
+        assert!(got.contains(&(98, 0, "currentMode".into())));
+    }
+
+    #[test]
+    fn empty_value_list_yields_no_targets() {
+        let n = node_with_values(1, vec![]);
+        assert!(primary_state_values_to_poll(&n).is_empty());
+    }
+
+    // ---- plan_primary_state_refresh: counter bookkeeping -----------------
+
+    #[test]
+    fn plan_counts_skipped_battery_and_eligible_no_targets() {
+        let nodes = vec![
+            // 1: mains + has switch → polled
+            node(json!({
+                "nodeId": 1, "isListening": true,
+                "values": [val(37, 0, "currentValue")]
+            })),
+            // 2: FLiRS + has lock → polled
+            node(json!({
+                "nodeId": 2, "isListening": false, "isFrequentListening": "250ms",
+                "values": [val(98, 0, "currentMode")]
+            })),
+            // 3: mains, only meter → eligible_no_targets
+            node(json!({
+                "nodeId": 3, "isListening": true,
+                "values": [val(50, 0, "value")]
+            })),
+            // 4: sleeping battery → skipped_battery
+            node(json!({
+                "nodeId": 4, "isListening": false, "isFrequentListening": false,
+                "values": [val(38, 0, "currentValue")]
+            })),
+            // 5: missing power-class metadata → skipped_battery (conservative)
+            node(json!({ "nodeId": 5 })),
+        ];
+
+        let plan = plan_primary_state_refresh(&nodes);
+
+        assert_eq!(plan.polls.len(), 2);
+        assert_eq!(plan.polls[0].0, 1);
+        assert_eq!(plan.polls[1].0, 2);
+        assert_eq!(plan.skipped_battery, 2);
+        assert_eq!(plan.eligible_no_targets, 1);
+    }
+
+    #[test]
+    fn plan_handles_empty_node_list() {
+        let plan = plan_primary_state_refresh(&[]);
+        assert_eq!(plan, PollPlan::default());
+    }
+
+    // ---- POLL_DELAY guard -------------------------------------------------
+
+    #[test]
+    fn poll_delay_is_200ms() {
+        // Sentinel — protects against accidental tightening that would
+        // saturate the Z-Wave radio on startup.
+        assert_eq!(POLL_DELAY, Duration::from_millis(200));
     }
 }
