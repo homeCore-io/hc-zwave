@@ -24,7 +24,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — Build
 # -----------------------------------------------------------------------------
-FROM rust:alpine AS builder
+FROM rust:1.95-alpine3.23@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
 
 RUN apk upgrade --no-cache && apk add --no-cache musl-dev openssl-dev pkgconfig
 
@@ -38,7 +38,7 @@ RUN cargo build --release --bin hc-zwave
 # -----------------------------------------------------------------------------
 # Stage 2 — Runtime
 # -----------------------------------------------------------------------------
-FROM alpine:3
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
 
 # `apk upgrade` first pulls CVE patches for packages baked into the
 # alpine:3 base since the upstream image was last rebuilt. Defense
