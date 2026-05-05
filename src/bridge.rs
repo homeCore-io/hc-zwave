@@ -309,15 +309,15 @@ fn primary_state_values_to_poll(node: &NodeState) -> Vec<(u32, u32, String)> {
     // (commandClass, property) pairs whose primary state we refresh. Add
     // new actuator command classes here as they appear on the network.
     const TARGETS: &[(u32, &str)] = &[
-        (37, "currentValue"),    // Binary Switch — on/off
-        (38, "currentValue"),    // Multilevel Switch — level (dimmer / shade / fan)
-        (64, "mode"),            // Thermostat Mode
-        (66, "state"),           // Thermostat Operating State
-        (67, "setpoint"),        // Thermostat Setpoint (per-type via propertyKey)
-        (68, "mode"),            // Thermostat Fan Mode
-        (98, "currentMode"),     // Door Lock
-        (102, "currentState"),   // Barrier Operator
-        (117, "currentColor"),   // Color Switch
+        (37, "currentValue"),  // Binary Switch — on/off
+        (38, "currentValue"),  // Multilevel Switch — level (dimmer / shade / fan)
+        (64, "mode"),          // Thermostat Mode
+        (66, "state"),         // Thermostat Operating State
+        (67, "setpoint"),      // Thermostat Setpoint (per-type via propertyKey)
+        (68, "mode"),          // Thermostat Fan Mode
+        (98, "currentMode"),   // Door Lock
+        (102, "currentState"), // Barrier Operator
+        (117, "currentColor"), // Color Switch
     ];
     let mut out = Vec::new();
     for v in &node.values {
@@ -1176,10 +1176,7 @@ mod tests {
     #[test]
     fn ignores_target_value_property() {
         // Target values are commands, not state; only currentValue is state.
-        let n = node_with_values(
-            1,
-            vec![val(37, 0, "targetValue"), val(38, 0, "duration")],
-        );
+        let n = node_with_values(1, vec![val(37, 0, "targetValue"), val(38, 0, "duration")]);
         assert!(primary_state_values_to_poll(&n).is_empty());
     }
 
