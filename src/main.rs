@@ -82,7 +82,7 @@ fn init_logging(
     config_path: &str,
 ) -> (
     tracing_appender::non_blocking::WorkerGuard,
-    hc_logging::LogLevelHandle,
+    plugin_sdk_rs::logging::LogLevelHandle,
     plugin_sdk_rs::mqtt_log_layer::MqttLogHandle,
 ) {
     #[derive(serde::Deserialize, Default)]
@@ -104,7 +104,7 @@ fn init_logging(
 async fn try_start(
     cfg: &Config,
     config_path: &str,
-    log_level_handle: hc_logging::LogLevelHandle,
+    log_level_handle: plugin_sdk_rs::logging::LogLevelHandle,
     mqtt_log_handle: plugin_sdk_rs::mqtt_log_layer::MqttLogHandle,
 ) -> Result<()> {
     // --- HomeCore MQTT (via SDK) ----------------------------------------------
@@ -207,8 +207,8 @@ async fn try_start(
 /// Capability manifest for hc-zwave. Declares the streaming actions
 /// (include_node, exclude_node) so the admin UI and hc-mcp can surface
 /// them without plugin-specific code.
-fn capabilities_manifest() -> hc_types::Capabilities {
-    use hc_types::{Action, Capabilities, Concurrency, ItemOp, RequiresRole};
+fn capabilities_manifest() -> plugin_sdk_rs::types::Capabilities {
+    use plugin_sdk_rs::types::{Action, Capabilities, Concurrency, ItemOp, RequiresRole};
     use serde_json::json;
 
     Capabilities {
