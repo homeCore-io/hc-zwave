@@ -168,6 +168,10 @@ async fn try_start(
         None => mgmt,
     };
 
+    // …and the plugin-authored descriptor the editor renders instead of
+    // guessing a form from the schema. Rides the same manifest.
+    let mgmt = mgmt.with_config_descriptor(config::config_descriptor());
+
     // Start the SDK event loop FIRST so the MQTT eventloop is pumping while
     // we register devices.  Without this, queued publishes block forever once
     // the rumqttc internal buffer fills up.
