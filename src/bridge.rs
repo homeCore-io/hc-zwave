@@ -131,6 +131,13 @@ async fn publish_node(
     }
 
     let state = build_state(node, translator);
+    // Retained, so a client connecting later knows what this node's attributes
+    // mean and which of them can actually be written.
+    if let Some(schema) = crate::schema::schema_json(&state, translator) {
+        publisher
+            .register_device_schema_json(&device_id, &schema)
+            .await?;
+    }
     // Partial-merge, NOT full replace. zwave-js's `start_listening` /
     // `node ready` snapshots can be transiently sparse — particularly
     // for a freshly-included node whose interview hasn't yet populated

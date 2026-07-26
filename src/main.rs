@@ -15,6 +15,7 @@ mod bridge;
 mod config;
 mod inclusion;
 mod logging;
+mod schema;
 mod translator;
 mod types;
 
