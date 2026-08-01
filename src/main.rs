@@ -15,12 +15,14 @@ mod bridge;
 mod config;
 mod inclusion;
 mod logging;
+mod schema;
 mod translator;
 mod types;
 
 use anyhow::Result;
 use bridge::Bridge;
 use config::Config;
+use plugin_sdk_rs::types::PluginNotice;
 use plugin_sdk_rs::{PluginClient, PluginConfig};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -127,6 +129,8 @@ async fn try_start(
         &cfg.logging.log_forward_level,
     );
     let publisher = client.device_publisher();
+    // Conditions for the plugin page, not only the log.
+    let notices = client.notices();
     let (cmd_tx, cmd_rx) = mpsc::channel::<(String, serde_json::Value)>(256);
 
     // Rescan signal — `rescan_nodes` management action pushes onto this
@@ -161,6 +165,17 @@ async fn try_start(
         });
     let mgmt = inclusion::register_actions(mgmt, inclusion_handle);
 
+    // Publish the operator-config JSON Schema so the hc-web editor renders a
+    // typed form (rides on the capability manifest).
+    let mgmt = match config::config_schema() {
+        Some(schema) => mgmt.with_config_schema(schema),
+        None => mgmt,
+    };
+
+    // …and the plugin-authored descriptor the editor renders instead of
+    // guessing a form from the schema. Rides the same manifest.
+    let mgmt = mgmt.with_config_descriptor(config::config_descriptor());
+
     // Start the SDK event loop FIRST so the MQTT eventloop is pumping while
     // we register devices.  Without this, queued publishes block forever once
     // the rumqttc internal buffer fills up.
@@ -191,6 +206,20 @@ async fn try_start(
         "hc-zwave connected",
     );
 
+    if cfg.server.url.trim().is_empty() {
+        notices.raise(
+            PluginNotice::error(
+                "not_configured",
+                "No zwave-js-server URL is set, so this plugin has nothing to connect to.",
+            )
+            .with_remedy(
+                "Set [server].url to the zwave-js-server WebSocket address, e.g. \
+                 ws://192.168.1.10:3000. That server is a separate service and must be \
+                 running before this plugin can see any devices.",
+            ),
+        );
+    }
+
     // --- Bridge loop (reconnects on WS disconnect) ---
     Bridge {
         config: cfg.clone(),
@@ -199,6 +228,7 @@ async fn try_start(
         control_rx,
         event_tx,
         rescan_rx,
+        notices,
     }
     .run()
     .await

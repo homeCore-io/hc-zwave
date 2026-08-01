@@ -19,7 +19,8 @@ use crate::translator::{property_key_str, synthetic_attr_name, Translator};
 use crate::types::{NodeState, NodeValue, ResultMsg, ServerMsg, ValueUpdatedArgs};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use plugin_sdk_rs::DevicePublisher;
+use plugin_sdk_rs::types::PluginNotice;
+use plugin_sdk_rs::{DevicePublisher, PluginNotices};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -131,6 +132,13 @@ async fn publish_node(
     }
 
     let state = build_state(node, translator);
+    // Retained, so a client connecting later knows what this node's attributes
+    // mean and which of them can actually be written.
+    if let Some(schema) = crate::schema::schema_json(&state, translator) {
+        publisher
+            .register_device_schema_json(&device_id, &schema)
+            .await?;
+    }
     // Partial-merge, NOT full replace. zwave-js's `start_listening` /
     // `node ready` snapshots can be transiently sparse — particularly
     // for a freshly-included node whose interview hasn't yet populated
@@ -453,6 +461,9 @@ pub struct Bridge {
     /// `rescan_nodes` management action pings this; the WS loop sends a
     /// fresh `start_listening` and republishes every node from the result.
     pub rescan_rx: mpsc::Receiver<()>,
+    /// What the operator sees on the plugin page when zwave-js-server is not
+    /// answering. The loop below retries forever and says so only in the log.
+    pub notices: PluginNotices,
 }
 
 impl Bridge {
@@ -466,6 +477,22 @@ impl Bridge {
                 }
                 Err(e) => {
                     error!(error = %e, backoff_secs, "Bridge error; reconnecting");
+                    self.notices.raise(
+                        PluginNotice::error(
+                            "server_unreachable",
+                            format!(
+                                "Cannot reach zwave-js-server at {} — {e}. Every Z-Wave \
+                                 device is unavailable until it comes back.",
+                                self.config.server.url
+                            ),
+                        )
+                        .with_remedy(
+                            "Check that zwave-js-server is running and that [server].url \
+                             points at its WebSocket address (ws://host:3000 by default). \
+                             It is a separate service from homeCore and has to be started \
+                             on its own.",
+                        ),
+                    );
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(60);
                 }
@@ -481,6 +508,8 @@ impl Bridge {
         let (ws_stream, _) = connect_async(&cfg.server.url)
             .await
             .with_context(|| format!("WS connect to {}", cfg.server.url))?;
+        // The socket is up — whatever the last failure was, it is over.
+        self.notices.clear("server_unreachable");
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         // --- Handshake ---
