@@ -22,6 +22,7 @@ mod types;
 use anyhow::Result;
 use bridge::Bridge;
 use config::Config;
+use plugin_sdk_rs::types::PluginNotice;
 use plugin_sdk_rs::{PluginClient, PluginConfig};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -128,6 +129,8 @@ async fn try_start(
         &cfg.logging.log_forward_level,
     );
     let publisher = client.device_publisher();
+    // Conditions for the plugin page, not only the log.
+    let notices = client.notices();
     let (cmd_tx, cmd_rx) = mpsc::channel::<(String, serde_json::Value)>(256);
 
     // Rescan signal — `rescan_nodes` management action pushes onto this
@@ -203,6 +206,20 @@ async fn try_start(
         "hc-zwave connected",
     );
 
+    if cfg.server.url.trim().is_empty() {
+        notices.raise(
+            PluginNotice::error(
+                "not_configured",
+                "No zwave-js-server URL is set, so this plugin has nothing to connect to.",
+            )
+            .with_remedy(
+                "Set [server].url to the zwave-js-server WebSocket address, e.g. \
+                 ws://192.168.1.10:3000. That server is a separate service and must be \
+                 running before this plugin can see any devices.",
+            ),
+        );
+    }
+
     // --- Bridge loop (reconnects on WS disconnect) ---
     Bridge {
         config: cfg.clone(),
@@ -211,6 +228,7 @@ async fn try_start(
         control_rx,
         event_tx,
         rescan_rx,
+        notices,
     }
     .run()
     .await
