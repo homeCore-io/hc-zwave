@@ -24,9 +24,24 @@ Device names sync from ZwaveJS UI node names.
 
 ## Setup
 
-1. Copy `config/config.toml.example` to `config/config.toml`
-2. Set the `url` to your zwave-js-server WebSocket endpoint (default `ws://localhost:3000`)
-3. Add a `[[plugins]]` entry in `homecore.toml`
+Install it from the web UI — **Plugins → Add** — then open its
+**Configuration** tab and set `url` to your zwave-js-server WebSocket
+endpoint (default `ws://localhost:3000`). Nodes come from the server; you do
+not list them by hand.
+
+homeCore records the install itself, so there is no `[[plugins]]` block to
+write. It owns the config file too — `config/plugins/plugin.zwave.toml` under
+homeCore's home directory — and restarts the plugin when that file changes.
+
+## Notices
+
+Problems are reported as **notices**, shown on the plugin's card in the web
+UI. They are state rather than log lines.
+
+| Code | Means |
+|---|---|
+| `not_configured` | No zwave-js-server URL set yet. |
+| `server_unreachable` | zwave-js-server is not answering on that WebSocket. Clears on reconnect. |
 
 ## Prerequisites
 
