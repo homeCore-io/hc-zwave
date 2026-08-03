@@ -398,7 +398,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hc-logging"
 version = "0.1.4"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#e15278cd80104fe4c1b8b980afbe97eb8c8d77c0"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#54d3ec7a81576f9c9a10a4a96d6d50dedf426f57"
 dependencies = [
  "anyhow",
  "chrono",
@@ -416,7 +416,7 @@ dependencies = [
 [[package]]
 name = "hc-time"
 version = "0.1.4"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#e15278cd80104fe4c1b8b980afbe97eb8c8d77c0"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#54d3ec7a81576f9c9a10a4a96d6d50dedf426f57"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -426,19 +426,19 @@ dependencies = [
 [[package]]
 name = "hc-types"
 version = "0.1.5"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#e15278cd80104fe4c1b8b980afbe97eb8c8d77c0"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#54d3ec7a81576f9c9a10a4a96d6d50dedf426f57"
 dependencies = [
  "chrono",
  "ron",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
 [[package]]
 name = "hc-zwave"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
