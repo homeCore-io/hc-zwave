@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 schemars           = { version = "0.8", optional = true }
-plugin-sdk-rs      = { git = "https://github.com/homeCore-io/hc-plugin-sdk-rs", tag = "v0.3.10" }
+plugin-sdk-rs      = { git = "https://github.com/homeCore-io/hc-plugin-sdk-rs", tag = "v0.4.0" }
 tokio              = { version = "1", features = ["full"] }
 tokio-tungstenite  = "0.24"
 rumqttc            = "0.25"
@@ -30,4 +30,4 @@ uuid               = { version = "1", features = ["v4"] }
 
 [features]
 default = ["schema"]
-schema = ["dep:schemars"]
+schema = ["dep:schemars", "plugin-sdk-rs/schema"]
