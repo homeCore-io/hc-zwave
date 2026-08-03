@@ -301,6 +301,16 @@ fn should_poll_initial_values(node: &NodeState) -> bool {
     )
 }
 
+/// One value to refresh on a node: `(commandClass, endpoint, property)`.
+///
+/// Endpoint is part of the identity rather than an afterthought — a dual-relay
+/// plug exposes the same command class and property on endpoints 1 and 2, and
+/// polling only one leaves the other stale.
+type PollTarget = (u32, u32, String);
+
+/// One node's worth of work: the node, and every value to refresh on it.
+type NodePolls = (u32, Vec<PollTarget>);
+
 /// Primary-state value IDs we ask zwave-js to refresh on startup. zwave-js
 /// caches each value's last seen state, but devices that only emit meter or
 /// sensor reports — and actuators that don't auto-report on local actuation —
@@ -313,7 +323,7 @@ fn should_poll_initial_values(node: &NodeState) -> bool {
 /// Endpoint is intentionally not constrained — multi-endpoint devices
 /// (e.g., a dual-relay smart plug exposing endpoints 1 and 2) need every
 /// endpoint refreshed.
-fn primary_state_values_to_poll(node: &NodeState) -> Vec<(u32, u32, String)> {
+fn primary_state_values_to_poll(node: &NodeState) -> Vec<PollTarget> {
     // (commandClass, property) pairs whose primary state we refresh. Add
     // new actuator command classes here as they appear on the network.
     const TARGETS: &[(u32, &str)] = &[
@@ -374,7 +384,7 @@ const POLL_DELAY: Duration = Duration::from_millis(200);
 struct PollPlan {
     /// Per-node targets to poll, in the order encountered.
     /// `(node_id, [(commandClass, endpoint, property), ...])`
-    polls: Vec<(u32, Vec<(u32, u32, String)>)>,
+    polls: Vec<NodePolls>,
     /// Sleeping battery devices we won't bother — zwave-js would just queue
     /// the request and flood the air at wake-up.
     skipped_battery: usize,
